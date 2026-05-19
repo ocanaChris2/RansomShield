@@ -1,0 +1,227 @@
+;/*++
+;
+; Module Name:
+;     RansomShield.inf
+;
+; Abstract:
+;     INF installation file for the RansomShield minifilter driver.
+;     This file is used by the Windows Setup API and the filter manager
+;     to install, register, and load the minifilter driver.
+;
+;     INF STRUCTURE:
+;     1. [Version]          - Driver signing and version info
+;     2. [DestinationDirs]  - Where files are copied during install
+;     3. [DefaultInstall]   - Default installation actions
+;     4. [DefaultInstall.Services] - Service registration
+;     5. [DefaultUninstall] - Uninstallation actions
+;     6. [DefaultUninstall.Services] - Service removal
+;     7. [SourceDisksNames] - Source disk identification
+;     8. [SourceDisksFiles] - Files on source disk
+;     9. [RansomShield_ServiceData] - Minifilter-specific registration
+;
+;     IMPORTANT MINIFILTER INF REQUIREMENTS:
+;     - The ServiceBinary must point to the driver .sys file.
+;     - The Instances section must list the minifilter's altitude.
+;     - The filter name must match RS_FILTER_NAME in the code.
+;     - The altitude must be in the Anti-Virus range (320000-329999).
+;
+; Author:
+;     RansomShield Development
+;
+;--*/
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"                          ; Minifilters use ActivityMonitor class
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8c12202e5a6}    ; GUID for ActivityMonitor class
+Provider    = %ProviderString%
+DriverVer   = 01/01/2026,1.0.0.0
+CatalogFile = RansomShield.cat
+
+;
+; ============================================================================
+; STRING DEFINITIONS
+; ============================================================================
+;
+
+[Strings]
+ProviderString          = "RansomShield Development"
+ServiceDescription      = "RansomShield Minifilter - Ransomware Detection and Prevention"
+ServiceName             = "RansomShield"
+DiskId1                 = "RansomShield Installation Disk"
+RansomShield.ServiceDesc= "RansomShield File System Minifilter Driver"
+AltitudeString          = "325010"
+
+;
+; ============================================================================
+; DESTINATION DIRECTORIES
+; ============================================================================
+;
+; 12 = %windir%\system32\drivers (standard location for kernel drivers)
+;
+; Minifilter drivers MUST be installed to the system32\drivers directory.
+; The filter manager expects to find the driver binary there.
+;
+
+[DestinationDirs]
+DefaultDestDir         = 12        ; %windir%\system32\drivers
+RansomShield_Files     = 12
+
+;
+; ============================================================================
+; DEFAULT INSTALL SECTION
+; ============================================================================
+;
+; This is the entry point when right-clicking the INF and selecting "Install",
+; or when using SetupAPI functions programmatically.
+;
+; CopyFiles directive copies the driver binary to the destination.
+; AddReg adds registry entries (none needed for basic minifilter).
+;
+
+[DefaultInstall]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = RansomShield_Files
+
+[DefaultInstall.Services]
+AddService  = %ServiceName%,,RansomShield_Service_Registration
+
+;
+; ============================================================================
+; DEFAULT UNINSTALL SECTION
+; ============================================================================
+;
+
+[DefaultUninstall]
+DelFiles   = RansomShield_Files
+LegacyUninstall = 1
+
+[DefaultUninstall.Services]
+DelService = %ServiceName%,0x200
+
+;
+; ============================================================================
+; SOURCE DISK INFORMATION
+; ============================================================================
+;
+
+[SourceDisksNames]
+1 = %DiskId1%,,,
+
+[SourceDisksFiles]
+RansomShield.sys = 1,,
+
+;
+; ============================================================================
+; FILE COPY SECTION
+; ============================================================================
+;
+
+[RansomShield_Files]
+RansomShield.sys,,,0x00000040  ; COPYFLG_OVERWRITE_OLDER_ONLY
+
+;
+; ============================================================================
+; SERVICE REGISTRATION
+; ============================================================================
+;
+; This section defines how the driver is registered as a Windows service.
+; The filter manager uses the service registration to load and manage
+; the minifilter driver.
+;
+; ServiceType = 2 (SERVICE_KERNEL_DRIVER) - Required for all kernel drivers.
+; StartType = 3 (SERVICE_DEMAND_START) - Driver is loaded on demand.
+;   For production deployment, use StartType = 1 (SERVICE_SYSTEM_START)
+;   to ensure the driver loads early during boot (before ransomware can
+;   execute). However, during development, DEMAND_START is preferred
+;   because it allows manual loading/unloading via 'fltmc' or 'sc'.
+; ErrorControl = 1 (SERVICE_ERROR_NORMAL) - Log error but continue boot.
+; ServiceBinary - Path to the driver binary.
+; AddReg - Adds minifilter-specific registry entries.
+;
+
+[RansomShield_Service_Registration]
+DisplayName    = %RansomShield.ServiceDesc%
+ServiceType    = 2               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START (development)
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\RansomShield.sys
+AddReg         = RansomShield_ServiceData
+
+;
+; ============================================================================
+; MINIFILTER SERVICE DATA
+; ============================================================================
+;
+; These registry entries are REQUIRED for minifilter drivers. The filter
+; manager reads them during initialization to discover and load minifilters.
+;
+; SupportedFeatures:
+;   Bit flags indicating which features the minifilter supports.
+;   0x3 = Supports both pre and post operations.
+;   The filter manager uses this for optimization (e.g., not calling
+;   post-callbacks if no minifilter supports them).
+;
+; Instances:
+;   Points to the section that defines the minifilter's instance
+;   configuration. This is how the filter manager knows the altitude
+;   and default behavior for this minifilter.
+;
+
+[RansomShield_ServiceData]
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,,"Instances",0x00000000,%ServiceName%
+
+;
+; ============================================================================
+; INSTANCE CONFIGURATION
+; ============================================================================
+;
+; The instance configuration tells the filter manager:
+;   1. Default altitude for this minifilter (determines position in stack).
+;   2. Default flags (whether to attach to volumes automatically).
+;   3. Altitude range (min/max allowed altitudes for this filter).
+;
+; ALTITUDE EXPLANATION:
+;   The altitude is a string that determines the order in which
+;   minifilters are invoked. Higher altitude = later invocation.
+;   The filter manager sorts minifilters by altitude before invoking
+;   their callbacks. Our altitude (325010) places us in the
+;   Anti-Virus range, after encryption filters but before scanners.
+;
+; FLAGS:
+;   0x01 = FLTFL_INSTANCING_AUTO_ATTACH - Automatically attach to all
+;          volumes when the minifilter loads. This ensures we start
+;          monitoring immediately without requiring manual attachment.
+;
+
+[RansomShield.Instances]
+DefaultInstance    = %ServiceName%
+
+[RansomShield.DefaultInstance]
+Altitude           = %AltitudeString%
+Flags              = 0x01              ; Auto-attach to all volumes
+
+;
+; ============================================================================
+; ARCHITECTURE-SPECIFIC SECTIONS
+; ============================================================================
+;
+; These sections allow the INF to support multiple architectures.
+; The setup engine selects the appropriate section based on the
+; target machine's architecture.
+;
+
+[DefaultInstall.NTamd64]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = RansomShield_Files
+
+[DefaultInstall.NTamd64.Services]
+AddService  = %ServiceName%,,RansomShield_Service_Registration
+
+[DefaultInstall.NTarm64]
+OptionDesc  = %ServiceDescription%
+CopyFiles   = RansomShield_Files
+
+[DefaultInstall.NTarm64.Services]
+AddService  = %ServiceName%,,RansomShield_Service_Registration

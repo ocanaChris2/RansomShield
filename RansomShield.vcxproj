@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <RootNamespace>RansomShield</RootNamespace>
+    <ProjectName>RansomShield</ProjectName>
+  </PropertyGroup>
+
+  <!--
+    WDK NuGet package props — must be imported before Microsoft.Cpp.Default.props
+    so that $(WDKContentRoot) and $(WindowsSdkDir) are available to later property groups.
+    Packages restored to: packages\ via nuget.exe restore RansomShield.sln -PackagesDirectory packages
+  -->
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\Microsoft.Windows.SDK.cpp.props')" />
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.CPP.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.CPP.x64.props')" />
+  <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\build\native\Microsoft.Windows.WDK.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\build\native\Microsoft.Windows.WDK.x64.props')" />
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <!--
+    ConfigurationType = DynamicLibrary because the WDK "Driver" ConfigurationType requires
+    the installed WDK VS extension (WindowsDriverClang toolset), which is not present here.
+    The .sys output extension and all kernel-mode compiler/linker flags are set explicitly below.
+  -->
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+    <TargetExt>.sys</TargetExt>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <!-- Kernel drivers cannot have a side-by-side application manifest -->
+    <EmbedManifest>false</EmbedManifest>
+    <GenerateManifest>false</GenerateManifest>
+    <!-- /DRIVER:WDM implies /RELEASE which conflicts with /INCREMENTAL -->
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+    <TargetExt>.sys</TargetExt>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <EmbedManifest>false</EmbedManifest>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\</IntDir>
+    <!-- Kernel drivers use the .sys extension, not .dll -->
+    <TargetExt>.sys</TargetExt>
+    <!-- WDK version from NuGet package -->
+    <WdkVer>10.0.26100.0</WdkVer>
+    <!--
+      Include paths:
+        WDK km      - fltkernel.h, ntddk.h, wdm.h, ntifs.h, and WDK-specific kernel headers
+        WDK shared  - WDK-specific shared headers (acpiioct.h etc.)
+        SDK shared  - fltUserStructures.h, ntstatus.h, ntdef.h, basetsd.h, and common shared headers
+                      (TargetPlatformSdkRootOverride is set by Microsoft.Windows.SDK.cpp.props)
+    -->
+    <WdkKmIncludes>$(WDKContentRoot)\Include\$(WdkVer)\km;$(WDKContentRoot)\Include\$(WdkVer)\shared;$(TargetPlatformSdkRootOverride)\Include\$(WdkVer)\shared</WdkKmIncludes>
+    <!-- Kernel-mode lib path from WDK NuGet package -->
+    <WdkKmLibs>$(WDKContentRoot)\Lib\$(WdkVer)\km\x64</WdkKmLibs>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;_AMD64_;NTDDI_VERSION=0x0A000009;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <CompileAs>CompileAsC</CompileAs>
+      <!-- Kernel mode: no C++ exceptions, no CRT buffer security (use BufferOverflowK.lib instead) -->
+      <ExceptionHandling>false</ExceptionHandling>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <!-- /kernel enables kernel-mode code generation; /GS- since we link BufferOverflowK.lib manually -->
+      <AdditionalOptions>/kernel /GS- %(AdditionalOptions)</AdditionalOptions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <!-- RTC (_RTC_*) requires the CRT which is not available in kernel mode -->
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <!-- Do not link MSVC runtime; kernel code links against ntoskrnl.lib -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <OutputFile>$(OutDir)$(TargetName).sys</OutputFile>
+      <!--
+        Kernel-mode libs:
+          ntoskrnl.lib   - NT kernel services (ExAllocatePool2, KeAcquireSpinLock, etc.)
+          fltMgr.lib     - Filter Manager APIs (FltRegisterFilter, FltSendMessage, etc.)
+          BufferOverflowK.lib - Kernel-mode stack cookie / GsDriverEntry wrapper
+          hal.lib        - Hardware Abstraction Layer
+          wdmsec.lib     - WDM security helpers (FltBuildDefaultSecurityDescriptor)
+      -->
+      <AdditionalDependencies>ntoskrnl.lib;fltMgr.lib;BufferOverflowK.lib;hal.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(WdkKmLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!-- Kernel driver: NATIVE subsystem, WDM driver type, no user-mode defaults -->
+      <SubSystem>Native</SubSystem>
+      <Driver>WDM</Driver>
+      <!-- GsDriverEntry is the kernel security-cookie wrapper that calls DriverEntry -->
+      <EntryPointSymbol>GsDriverEntry</EntryPointSymbol>
+      <!-- Exclude all user-mode CRT default libs; kernel uses ntoskrnl instead -->
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- Kernel drivers cannot have a side-by-side manifest -->
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <PreprocessorDefinitions>NDEBUG;_AMD64_;NTDDI_VERSION=0x0A000009;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <CompileAs>CompileAsC</CompileAs>
+      <ExceptionHandling>false</ExceptionHandling>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <AdditionalOptions>/kernel /GS- %(AdditionalOptions)</AdditionalOptions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <OutputFile>$(OutDir)$(TargetName).sys</OutputFile>
+      <AdditionalDependencies>ntoskrnl.lib;fltMgr.lib;BufferOverflowK.lib;hal.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(WdkKmLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <SubSystem>Native</SubSystem>
+      <Driver>WDM</Driver>
+      <EntryPointSymbol>GsDriverEntry</EntryPointSymbol>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="RansomShield.c" />
+    <ClCompile Include="Context.c" />
+    <ClCompile Include="CommPort.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="RansomShield.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="RansomShield.inf" />
+    <None Include="packages.config" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>

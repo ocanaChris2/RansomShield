@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B2C3D4E5-F6A7-8901-BCDE-F12345678901}</ProjectGuid>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <RootNamespace>RansomShieldClient</RootNamespace>
+    <ProjectName>RansomShieldClient</ProjectName>
+  </PropertyGroup>
+
+  <!--
+    Import the same WDK/SDK NuGet package props as the driver project.
+    These must come before Microsoft.Cpp.Default.props.
+    They set $(WindowsSdkDir), $(TargetPlatformSdkRootOverride), and
+    $(WindowsTargetPlatformVersion) so the toolset finds headers/libs
+    from the NuGet packages instead of an installed Windows SDK.
+  -->
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\Microsoft.Windows.SDK.cpp.props')" />
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.CPP.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.CPP.x64.props')" />
+  <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\build\native\Microsoft.Windows.WDK.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\build\native\Microsoft.Windows.WDK.x64.props')" />
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\Client\</IntDir>
+    <WdkVer>10.0.26100.0</WdkVer>
+    <!--
+      Explicit include paths from the NuGet packages.
+      $(TargetPlatformSdkRootOverride) = SDK.CPP base package \c dir
+      Provides: FltUser.h, Windows.h, ucrt headers, shared headers.
+    -->
+    <UserModeIncludes>$(TargetPlatformSdkRootOverride)\Include\$(WdkVer)\um;$(TargetPlatformSdkRootOverride)\Include\$(WdkVer)\shared;$(TargetPlatformSdkRootOverride)\Include\$(WdkVer)\ucrt</UserModeIncludes>
+    <!--
+      $(winsdk_cpp_x64_root) = SDK.CPP.x64 package \c dir
+      Provides: fltLib.lib, advapi32.lib, kernel32.lib, ucrt libs.
+    -->
+    <UserModeLibs>$(winsdk_cpp_x64_root)\um\x64;$(winsdk_cpp_x64_root)\ucrt\x64</UserModeLibs>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <!-- fltLib.lib: Filter Manager user-mode API (FilterConnect/Send/GetMessage) -->
+      <AdditionalDependencies>fltLib.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(UserModeLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltLib.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(UserModeLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="Main.cpp" />
+    <ClCompile Include="CommManager.cpp" />
+    <ClCompile Include="ConfigManager.cpp" />
+    <ClCompile Include="EventLogger.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="CommManager.h" />
+    <ClInclude Include="ConfigManager.h" />
+    <ClInclude Include="EventLogger.h" />
+    <ClInclude Include="SharedDefs.h" />
+    <ClInclude Include="RansomShieldClient.h" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>

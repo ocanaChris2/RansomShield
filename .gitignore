@@ -1,0 +1,27 @@
+# Build output
+x64/
+Win32/
+ARM64/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.sys
+
+# NuGet packages (restored by: nuget.exe restore RansomShield.sln -PackagesDirectory packages)
+packages/
+
+# nuget.exe binary (downloaded at build time)
+nuget.exe
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.vcxproj.filters
+*.VC.db
+*.VC.opendb
+ipch/
