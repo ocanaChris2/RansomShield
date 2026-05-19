@@ -51,6 +51,7 @@ ServiceName             = "RansomShield"
 DiskId1                 = "RansomShield Installation Disk"
 RansomShield.ServiceDesc= "RansomShield File System Minifilter Driver"
 AltitudeString          = "325010"
+DefaultInstance         = "RansomShield"
 
 ;
 ; ============================================================================
@@ -142,10 +143,11 @@ RansomShield.sys,,,0x00000040  ; COPYFLG_OVERWRITE_OLDER_ONLY
 
 [RansomShield_Service_Registration]
 DisplayName    = %RansomShield.ServiceDesc%
-ServiceType    = 2               ; SERVICE_KERNEL_DRIVER
+ServiceType    = 2               ; SERVICE_FILE_SYSTEM_DRIVER
 StartType      = 3               ; SERVICE_DEMAND_START (development)
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\RansomShield.sys
+LoadOrderGroup = FSFilter Activity Monitor
 AddReg         = RansomShield_ServiceData
 
 ;
@@ -170,7 +172,9 @@ AddReg         = RansomShield_ServiceData
 
 [RansomShield_ServiceData]
 HKR,,"SupportedFeatures",0x00010001,0x3
-HKR,,"Instances",0x00000000,%ServiceName%
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\RansomShield","Altitude",0x00000000,%AltitudeString%
+HKR,"Instances\RansomShield","Flags",0x00010001,0x01
 
 ;
 ; ============================================================================

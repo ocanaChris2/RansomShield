@@ -74,7 +74,8 @@ Environment:
 // from kernel mode or user mode. In kernel mode, we use NT types directly.
 // In user mode, we use Windows.h types and define compatibility macros.
 //
-#ifdef _KERNEL_MODE
+#if defined(_KERNEL_MODE) || defined(_FLTKERNEL_)
+    // Kernel-mode build: fltkernel.h is already included by the .c file; this is a no-op.
     #include <fltkernel.h>
 #else
     #include <windows.h>
@@ -178,6 +179,11 @@ typedef enum _RS_MESSAGE_TYPE {
     RsQueryBlockedPids = 100,
 
     //
+    // Kernel -> User: Reply to RsQueryBlockedPids.
+    //
+    RsReplyBlockedPids = 101,
+
+    //
     // Query the driver's current configuration (thresholds, monitoring state).
     // Request:  RS_REQUEST_QUERY_CONFIG
     // Response: RS_REPLY_CONFIG
@@ -199,6 +205,9 @@ typedef enum _RS_MESSAGE_TYPE {
     // Response: RS_REPLY_UNBLOCK_PID
     //
     RsRequestUnblockPid = 200,
+
+    // Kernel -> User: Reply to RsRequestUnblockPid.
+    RsReplyUnblockPid = 201,
 
     //
     // Pause monitoring (stop blocking but continue tracking).

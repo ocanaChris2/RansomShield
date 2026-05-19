@@ -88,12 +88,24 @@ ULONG       g_TrackedPidCount = 0;
 ULONG       g_MessageSequence = 0;
 
 //
-// Allowlist: array of UNICODE_STRINGs pointing to static wide-string
-// literals. These strings are in the driver's .rdata section which is
-// always resident (non-pageable), so it's safe to access at DISPATCH_LEVEL.
+// Runtime-configurable heuristic parameters.  All protected by g_ContextLock.
+// Initialized from the SharedDefs.h defaults; overwritten by UpdateConfig messages.
 //
-// Note: UNICODE_STRING does NOT own the buffer; it merely points to it.
-// So no allocation/deallocation is needed for these.
+ULONG    g_FileCountThreshold = RS_DEFAULT_FILE_COUNT_THRESHOLD;
+ULONG    g_TimeWindowSeconds  = RS_DEFAULT_TIME_WINDOW_SECONDS;
+LONGLONG g_TimeWindowTicks    = (LONGLONG)RS_DEFAULT_TIME_WINDOW_SECONDS * 10000000LL;
+BOOLEAN  g_MonitoringEnabled  = RS_DEFAULT_MONITORING_ENABLED;
+
+//
+// Dynamic allowlist populated at runtime via user-mode push messages.
+// Entries are null-terminated wide strings.  Protected by g_ContextLock.
+// Resides in the driver image's .data section — always non-paged.
+//
+WCHAR g_DynamicAllowlist[RS_MAX_ALLOWLIST_ENTRIES][RS_MAX_ALLOWLIST_NAME_LEN];
+ULONG g_DynamicAllowlistCount = 0;
+
+//
+// Static built-in allowlist: UNICODE_STRINGs pointing into .rdata literals.
 //
 UNICODE_STRING g_Allowlist[RS_ALLOWLIST_COUNT];
 
@@ -720,7 +732,7 @@ RecordAndEvaluate:
 
         count = context->OperationCount;
         for (i = 0; i < count; i++) {
-            if ((currentTime - context->Operations[idx].Timestamp) <= RS_TIME_WINDOW_TICKS) {
+            if ((currentTime - context->Operations[idx].Timestamp) <= g_TimeWindowTicks) {
                 recentCount++;
             }
             idx = (idx + 1) % RS_MAX_OPERATIONS_PER_PID;
@@ -743,7 +755,7 @@ RecordAndEvaluate:
     LONGLONG localBlockedTimestamp = 0;
     BOOLEAN localShouldNotify = FALSE;
 
-    if (recentCount >= RS_MODIFICATION_THRESHOLD && !context->IsBlocked) {
+    if (recentCount >= g_FileCountThreshold && !context->IsBlocked && g_MonitoringEnabled) {
         //
         // THRESHOLD EXCEEDED! Mark this PID as malicious.
         //
@@ -848,7 +860,7 @@ RsPruneOldOperations(
     for (i = 0; i < Context->OperationCount; i++) {
         LONGLONG age = CurrentTime - Context->Operations[readIdx].Timestamp;
 
-        if (age <= RS_TIME_WINDOW_TICKS) {
+        if (age <= g_TimeWindowTicks) {
             //
             // Entry is within the window. Keep it.
             //
@@ -1060,18 +1072,142 @@ RsIsProcessAllowlisted(
     processFileName.MaximumLength = processFileName.Length;
 
     //
-    // Compare against each allowlist entry using case-insensitive comparison.
-    //
-    // RtlEqualUnicodeString returns BOOLEAN (not NTSTATUS). It performs a
-    // byte-by-byte comparison with optional case insensitivity. It's safe
-    // at any IRQL as long as both buffers are accessible.
+    // Check the static (built-in) allowlist.
     //
     for (i = 0; i < RS_ALLOWLIST_COUNT; i++) {
         if (RtlEqualUnicodeString(&processFileName, &g_Allowlist[i], TRUE)) {
-            DbgPrint("RansomShield: PID allowlisted - %wZ\n", &processFileName);
+            DbgPrint("RansomShield: PID allowlisted (static) - %wZ\n", &processFileName);
+            return TRUE;
+        }
+    }
+
+    //
+    // Check the dynamic (user-pushed) allowlist under the spinlock.
+    // Entries are non-paged globals so RtlEqualUnicodeString is safe at DISPATCH_LEVEL.
+    //
+    {
+        KIRQL oldIrql;
+        BOOLEAN found = FALSE;
+        ULONG dynCount;
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        dynCount = g_DynamicAllowlistCount;
+        for (i = 0; i < dynCount; i++) {
+            UNICODE_STRING dynEntry;
+            RtlInitUnicodeString(&dynEntry, g_DynamicAllowlist[i]);
+            if (RtlEqualUnicodeString(&processFileName, &dynEntry, TRUE)) {
+                found = TRUE;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        if (found) {
+            DbgPrint("RansomShield: PID allowlisted (dynamic) - %wZ\n", &processFileName);
             return TRUE;
         }
     }
 
     return FALSE;
+}
+
+// ============================================================================
+// RUNTIME CONFIG AND DYNAMIC ALLOWLIST
+// ============================================================================
+
+VOID
+RsApplyConfig(
+    _In_ ULONG FileCountThreshold,
+    _In_ ULONG TimeWindowSeconds,
+    _In_ BOOLEAN MonitoringEnabled
+    )
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+    if (FileCountThreshold > 0) {
+        g_FileCountThreshold = FileCountThreshold;
+    }
+    if (TimeWindowSeconds > 0) {
+        g_TimeWindowSeconds = TimeWindowSeconds;
+        g_TimeWindowTicks   = (LONGLONG)TimeWindowSeconds * 10000000LL;
+    }
+    g_MonitoringEnabled = MonitoringEnabled;
+    KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+    DbgPrint("RansomShield: RsApplyConfig: threshold=%lu window=%lu monitoring=%d\n",
+             FileCountThreshold, TimeWindowSeconds, (int)MonitoringEnabled);
+}
+
+VOID
+RsClearDynamicAllowlist(
+    VOID
+    )
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+    g_DynamicAllowlistCount = 0;
+    RtlZeroMemory(g_DynamicAllowlist, sizeof(g_DynamicAllowlist));
+    KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+    DbgPrint("RansomShield: Dynamic allowlist cleared\n");
+}
+
+VOID
+RsAddDynamicAllowlistEntry(
+    _In_reads_(EntryLen) PWCHAR Entry,
+    _In_ ULONG EntryLen
+    )
+{
+    KIRQL oldIrql;
+    ULONG copyLen;
+
+    if (Entry == NULL || EntryLen == 0) {
+        return;
+    }
+
+    KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+
+    if (g_DynamicAllowlistCount < RS_MAX_ALLOWLIST_ENTRIES) {
+        copyLen = EntryLen < (RS_MAX_ALLOWLIST_NAME_LEN - 1)
+                  ? EntryLen
+                  : (RS_MAX_ALLOWLIST_NAME_LEN - 1);
+
+        RtlCopyMemory(g_DynamicAllowlist[g_DynamicAllowlistCount],
+                      Entry,
+                      copyLen * sizeof(WCHAR));
+        g_DynamicAllowlist[g_DynamicAllowlistCount][copyLen] = L'\0';
+        g_DynamicAllowlistCount++;
+    }
+
+    KeReleaseSpinLock(&g_ContextLock, oldIrql);
+}
+
+VOID
+RsGetPidCounts(
+    _Out_ PULONG TrackedCount,
+    _Out_ PULONG BlockedCount
+    )
+{
+    KIRQL oldIrql;
+    ULONG blocked = 0;
+    ULONG i;
+    PLIST_ENTRY listHead, entry;
+    PRS_PROCESS_CONTEXT context;
+
+    KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+
+    for (i = 0; i < RS_HASH_TABLE_SIZE; i++) {
+        listHead = &g_ContextHashTable[i];
+        for (entry = listHead->Flink; entry != listHead; entry = entry->Flink) {
+            context = CONTAINING_RECORD(entry, RS_PROCESS_CONTEXT, Link);
+            if (context->IsBlocked) {
+                blocked++;
+            }
+        }
+    }
+
+    *TrackedCount = g_TrackedPidCount;
+    *BlockedCount = blocked;
+
+    KeReleaseSpinLock(&g_ContextLock, oldIrql);
 }

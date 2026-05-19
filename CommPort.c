@@ -365,8 +365,9 @@ RsSendBlockNotification(
     notification.Header.SequenceNumber = g_MessageSequence++;
     KeReleaseSpinLock(&g_ContextLock, oldIrql);
 
-    notification.Header.MessageType = RsNotifyBlockedPid;
-    notification.Header.MessageSize = sizeof(RS_NOTIFICATION_BLOCKED_PID);
+    notification.Header.MessageType     = RsNotifyBlockedPid;
+    notification.Header.MessageSize     = sizeof(RS_NOTIFICATION_BLOCKED_PID);
+    notification.Header.ProtocolVersion = RS_PROTOCOL_VERSION;
     notification.ProcessId = ProcessId;
     notification.BlockedTimestamp = BlockedTimestamp;
     notification.OperationCount = OperationCount;
@@ -637,8 +638,9 @@ RsMessageNotifyCallback(
         reply->Header.SequenceNumber = g_MessageSequence++;
         KeReleaseSpinLock(&g_ContextLock, oldIrql);
 
-        reply->Header.MessageType = RsReplyBlockedPids;
-        reply->Header.MessageSize = requiredSize;
+        reply->Header.MessageType     = RsReplyBlockedPids;
+        reply->Header.MessageSize     = requiredSize;
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
 
         //
         // Get the list of blocked PIDs. RsGetBlockedPids acquires
@@ -690,8 +692,9 @@ RsMessageNotifyCallback(
         reply->Header.SequenceNumber = g_MessageSequence++;
         KeReleaseSpinLock(&g_ContextLock, oldIrql);
 
-        reply->Header.MessageType = RsReplyUnblockPid;
-        reply->Header.MessageSize = requiredSize;
+        reply->Header.MessageType     = RsReplyUnblockPid;
+        reply->Header.MessageSize     = requiredSize;
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
         reply->ProcessId = request->ProcessId;
 
         //
@@ -716,11 +719,291 @@ RsMessageNotifyCallback(
         break;
     }
 
+    // ---- QUERY CURRENT CONFIG ----
+    case RsQueryConfig:
+    {
+        PRS_REPLY_CONFIG reply;
+
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_CONFIG)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_CONFIG);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        reply = (PRS_REPLY_CONFIG)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_CONFIG));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        reply->FileCountThreshold    = g_FileCountThreshold;
+        reply->TimeWindowSeconds     = g_TimeWindowSeconds;
+        reply->MonitoringEnabled     = g_MonitoringEnabled;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType    = RsQueryConfig;
+        reply->Header.MessageSize    = sizeof(RS_REPLY_CONFIG);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+
+        RsGetPidCounts(&reply->TrackedPidCount, &reply->BlockedPidCount);
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_CONFIG);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    // ---- QUERY CURRENT ALLOWLIST ----
+    case RsQueryAllowlist:
+    {
+        PRS_REPLY_ALLOWLIST reply;
+        ULONG dynCount;
+        ULONG i;
+
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_ALLOWLIST)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_ALLOWLIST);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        reply = (PRS_REPLY_ALLOWLIST)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_ALLOWLIST));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        dynCount = g_DynamicAllowlistCount;
+        for (i = 0; i < dynCount && i < RS_MAX_ALLOWLIST_ENTRIES; i++) {
+            RtlCopyMemory(reply->Entries[i], g_DynamicAllowlist[i],
+                          RS_MAX_ALLOWLIST_NAME_LEN * sizeof(WCHAR));
+        }
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType     = RsQueryAllowlist;
+        reply->Header.MessageSize     = sizeof(RS_REPLY_ALLOWLIST);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+        reply->Count                  = dynCount;
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_ALLOWLIST);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    // ---- PAUSE MONITORING ----
+    case RsRequestPause:
+    {
+        PRS_REPLY_GENERIC reply;
+
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        g_MonitoringEnabled = FALSE;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply = (PRS_REPLY_GENERIC)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType    = RsRequestPause;
+        reply->Header.MessageSize    = sizeof(RS_REPLY_GENERIC);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+        reply->Status = STATUS_SUCCESS;
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+        DbgPrint("RansomShield: Monitoring paused\n");
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    // ---- RESUME MONITORING ----
+    case RsRequestResume:
+    {
+        PRS_REPLY_GENERIC reply;
+
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        g_MonitoringEnabled = TRUE;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply = (PRS_REPLY_GENERIC)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType    = RsRequestResume;
+        reply->Header.MessageSize    = sizeof(RS_REPLY_GENERIC);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+        reply->Status = STATUS_SUCCESS;
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+        DbgPrint("RansomShield: Monitoring resumed\n");
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    // ---- UPDATE CONFIG ----
+    case RsUpdateConfig:
+    {
+        PRS_REQUEST_UPDATE_CONFIG request;
+        PRS_REPLY_GENERIC reply;
+
+        if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_CONFIG)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        request = (PRS_REQUEST_UPDATE_CONFIG)InputBuffer;
+        RsApplyConfig(request->FileCountThreshold,
+                       request->TimeWindowSeconds,
+                       request->MonitoringEnabled);
+
+        reply = (PRS_REPLY_GENERIC)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType     = RsUpdateConfig;
+        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+        reply->Status = STATUS_SUCCESS;
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    // ---- CLEAR ALLOWLIST ----
+    case RsClearAllowlist:
+    {
+        PRS_REPLY_GENERIC reply;
+
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        RsClearDynamicAllowlist();
+
+        reply = (PRS_REPLY_GENERIC)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType     = RsClearAllowlist;
+        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+        reply->Status = STATUS_SUCCESS;
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    // ---- UPDATE ALLOWLIST (CHUNK) ----
+    case RsUpdateAllowlistChunk:
+    {
+        PRS_REQUEST_UPDATE_ALLOWLIST_CHUNK request;
+        PRS_REPLY_GENERIC reply;
+        ULONG i;
+
+        if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_ALLOWLIST_CHUNK)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        request = (PRS_REQUEST_UPDATE_ALLOWLIST_CHUNK)InputBuffer;
+
+        if (request->EntryCount > RS_MAX_ALLOWLIST_CHUNK) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        for (i = 0; i < request->EntryCount; i++) {
+            ULONG len = 0;
+            PWCHAR p = request->Entries[i];
+            while (len < RS_MAX_ALLOWLIST_NAME_LEN - 1 && p[len] != L'\0') { len++; }
+            RsAddDynamicAllowlistEntry(request->Entries[i], len);
+        }
+
+        reply = (PRS_REPLY_GENERIC)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType     = RsUpdateAllowlistChunk;
+        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+        reply->Status = STATUS_SUCCESS;
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    // ---- UPDATE ALLOWLIST (FULL) ----
+    case RsUpdateAllowlistFull:
+    {
+        PRS_REQUEST_UPDATE_ALLOWLIST_FULL request;
+        PRS_REPLY_GENERIC reply;
+        ULONG i;
+
+        if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_ALLOWLIST_FULL)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
+            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        request = (PRS_REQUEST_UPDATE_ALLOWLIST_FULL)InputBuffer;
+
+        if (request->EntryCount > RS_MAX_ALLOWLIST_ENTRIES) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        for (i = 0; i < request->EntryCount; i++) {
+            ULONG len = 0;
+            PWCHAR p = request->Entries[i];
+            while (len < RS_MAX_ALLOWLIST_NAME_LEN - 1 && p[len] != L'\0') { len++; }
+            RsAddDynamicAllowlistEntry(request->Entries[i], len);
+        }
+
+        reply = (PRS_REPLY_GENERIC)OutputBuffer;
+        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
+
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        reply->Header.SequenceNumber = g_MessageSequence++;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        reply->Header.MessageType     = RsUpdateAllowlistFull;
+        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
+        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
+        reply->Status = STATUS_SUCCESS;
+
+        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
     default:
-        //
-        // Unknown message type. This could be a version mismatch between
-        // the driver and the user-mode service.
-        //
         DbgPrint("RansomShield: Unknown message type %d\n",
                  requestHeader->MessageType);
         status = STATUS_INVALID_PARAMETER;

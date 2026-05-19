@@ -46,6 +46,13 @@ IRQL Considerations:
 //
 
 //
+// Pull in the shared kernel/user-mode protocol types.
+// fltkernel.h is always included by the .c files before RansomShield.h, so
+// _FLTKERNEL_ will be defined and SharedDefs.h will take the kernel path.
+//
+#include "SharedDefs.h"
+
+//
 // Pool tag for all allocations. Used by Driver Verifier and pool tracking.
 // 'RsSh' = RansomShield
 //
@@ -56,13 +63,6 @@ IRQL Considerations:
 // Must match the name in the INF file's Instances section.
 //
 #define RS_FILTER_NAME          L"RansomShield"
-
-//
-// Communication port name. User-mode clients open this path via
-// FilterConnectCommunicationPort(). The name must start with '\\' and
-// typically lives under \Device\.
-//
-#define RS_PORT_NAME            L"\\RansomShieldPort"
 
 //
 // Altitude for this minifilter. Altitudes determine the order in which
@@ -83,54 +83,19 @@ IRQL Considerations:
 //
 
 //
-// Maximum number of file modifications (writes, renames, deletes) allowed
-// per process within the sliding time window before the process is flagged
-// as potentially malicious.
+// Compile-time defaults — used only to initialize the runtime globals in
+// Context.c (g_FileCountThreshold, g_TimeWindowSeconds, g_TimeWindowTicks).
+// After startup these can be overridden by the user-mode client.
 //
-// A typical legitimate process rarely modifies more than 10-15 files in a
-// 10-second window. Ransomware can encrypt thousands. Setting this to 50
-// provides a generous margin for legitimate bursty I/O (e.g., compiler
-// builds, Windows Update) while still catching mass encryption.
-//
-#define RS_MODIFICATION_THRESHOLD       50
-
-//
-// Duration of the sliding time window in seconds. Operations older than
-// this are pruned from the per-PID tracking structure.
-//
-// 10 seconds is chosen because:
-// 1. It's long enough to avoid false positives from brief I/O bursts.
-// 2. It's short enough to catch fast-encrypting ransomware variants
-//    that attempt to encrypt an entire system in under a minute.
-//
-#define RS_TIME_WINDOW_SECONDS          10
-
-//
-// Convert seconds to the Windows LARGE_INTEGER tick format.
-// KeQueryInterruptTime() returns time in 100-nanosecond intervals.
-//
+#define RS_MODIFICATION_THRESHOLD       RS_DEFAULT_FILE_COUNT_THRESHOLD   // 50
+#define RS_TIME_WINDOW_SECONDS          RS_DEFAULT_TIME_WINDOW_SECONDS     // 10
 #define RS_TIME_WINDOW_TICKS            ((LONGLONG)RS_TIME_WINDOW_SECONDS * 10000000)
 
 //
 // Maximum number of process contexts we track simultaneously. This bounds
-// memory usage in non-paged pool. If more unique PIDs are active, the
-// oldest (least recently updated) entries are recycled via LRU eviction.
-//
-// 1024 processes is generous; a typical workstation has <300 active PIDs.
+// memory usage in non-paged pool.
 //
 #define RS_MAX_TRACKED_PIDS             1024
-
-//
-// Maximum number of blocked PIDs to report in a single user-mode query.
-// This keeps the communication buffer size bounded.
-//
-#define RS_MAX_REPORT_BLOCKED           256
-
-//
-// Maximum length (in WCHARs) for an image name stored in the allowlist
-// or blocked process list. Includes null terminator.
-//
-#define RS_MAX_IMAGE_NAME_LEN           260
 
 //
 // ============================================================================
@@ -138,24 +103,7 @@ IRQL Considerations:
 // ============================================================================
 //
 
-//
-// Number of entries in the built-in allowlist. This is a compile-time
-// constant array; runtime allowlist updates happen via the communication
-// port (not yet implemented in this version).
-//
-// These processes are excluded because they perform legitimate bulk file
-// operations:
-//   - svchost.exe:    Windows Service Host; may do Windows Update I/O
-//   - SearchIndexer.exe: Windows Search Indexer; constantly modifies index files
-//   - MsMpEng.exe:    Windows Defender; scans and quarantines files
-//   - TrustedInstaller.exe: Windows Module Installer; system updates
-//   - System:         Kernel system process; handles page file I/O
-//   - smss.exe:       Session Manager; early boot file operations
-//   - csrss.exe:      Client/Server Runtime Subsystem
-//   - wininit.exe:    Windows Start-Up Application
-//   - services.exe:   Service Control Manager
-//   - dwm.exe:        Desktop Window Manager
-//
+// Number of entries in the hardcoded built-in static allowlist.
 #define RS_ALLOWLIST_COUNT              10
 
 //
@@ -296,163 +244,35 @@ typedef struct _RS_PROCESS_CONTEXT {
 // have a dedicated thread calling FilterGetMessage() in a loop.
 //
 
-//
-// Message types exchanged between kernel and user mode.
-//
-typedef enum _RS_MESSAGE_TYPE {
-
-    //
-    // Kernel -> User: A new PID has been blocked. Payload is
-    // RS_NOTIFICATION_BLOCKED_PID.
-    //
-    RsNotifyBlockedPid = 1,
-
-    //
-    // User -> Kernel: Query all currently blocked PIDs.
-    // No payload; kernel replies with RS_REPLY_BLOCKED_PIDS.
-    //
-    RsQueryBlockedPids = 100,
-
-    //
-    // Kernel -> User: Reply to RsQueryBlockedPids. Payload is
-    // RS_REPLY_BLOCKED_PIDS containing the list of blocked PIDs.
-    //
-    RsReplyBlockedPids = 101,
-
-    //
-    // User -> Kernel: Unblock a specific PID. Payload is
-    // RS_REQUEST_UNBLOCK_PID with the PID to unblock.
-    //
-    RsRequestUnblockPid = 200,
-
-    //
-    // Kernel -> User: Acknowledgment of unblock request. Payload is
-    // RS_REPLY_UNBLOCK_PID with status code.
-    //
-    RsReplyUnblockPid = 201,
-
-} RS_MESSAGE_TYPE, *PRS_MESSAGE_TYPE;
-
-//
-// Common header for all messages. Modeled after the FILTER_MESSAGE_HEADER
-// that the filter manager prepends internally. Our header comes AFTER
-// the filter manager's header in the message buffer.
-//
-typedef struct _RS_MESSAGE_HEADER {
-    RS_MESSAGE_TYPE     MessageType;        // Type of this message
-    ULONG               MessageSize;        // Total size including this header
-    ULONG               SequenceNumber;     // Monotonically increasing counter
-} RS_MESSAGE_HEADER, *PRS_MESSAGE_HEADER;
-
-//
-// Notification sent from kernel to user mode when a PID is newly blocked.
-// The kernel calls FltSendMessage() with this structure.
-//
-typedef struct _RS_NOTIFICATION_BLOCKED_PID {
-    RS_MESSAGE_HEADER   Header;             // MessageType = RsNotifyBlockedPid
-    ULONG               ProcessId;          // The blocked PID
-    WCHAR               ImageName[RS_MAX_IMAGE_NAME_LEN]; // Process image name
-    LONGLONG            BlockedTimestamp;   // When the block occurred (100ns ticks)
-    ULONG               OperationCount;     // Number of ops that triggered the block
-} RS_NOTIFICATION_BLOCKED_PID, *PRS_NOTIFICATION_BLOCKED_PID;
-
-//
-// Request to query all blocked PIDs. Sent from user mode.
-//
-typedef struct _RS_REQUEST_BLOCKED_PIDS {
-    RS_MESSAGE_HEADER   Header;             // MessageType = RsQueryBlockedPids
-} RS_REQUEST_BLOCKED_PIDS, *PRS_REQUEST_BLOCKED_PIDS;
-
-//
-// Reply from kernel with the list of blocked PIDs.
-//
-typedef struct _RS_BLOCKED_PID_ENTRY {
-    ULONG               ProcessId;
-    WCHAR               ImageName[RS_MAX_IMAGE_NAME_LEN];
-    LONGLONG            BlockedTimestamp;
-    ULONG               OperationCount;
-} RS_BLOCKED_PID_ENTRY, *PRS_BLOCKED_PID_ENTRY;
-
-typedef struct _RS_REPLY_BLOCKED_PIDS {
-    RS_MESSAGE_HEADER   Header;             // MessageType = RsReplyBlockedPids
-    ULONG               Count;              // Number of entries in Entries[]
-    RS_BLOCKED_PID_ENTRY Entries[RS_MAX_REPORT_BLOCKED];
-} RS_REPLY_BLOCKED_PIDS, *PRS_REPLY_BLOCKED_PIDS;
-
-//
-// Request to unblock a specific PID. Sent from user mode.
-//
-typedef struct _RS_REQUEST_UNBLOCK_PID {
-    RS_MESSAGE_HEADER   Header;             // MessageType = RsRequestUnblockPid
-    ULONG               ProcessId;          // PID to unblock
-} RS_REQUEST_UNBLOCK_PID, *PRS_REQUEST_UNBLOCK_PID;
-
-//
-// Reply from kernel acknowledging the unblock request.
-//
-typedef struct _RS_REPLY_UNBLOCK_PID {
-    RS_MESSAGE_HEADER   Header;             // MessageType = RsReplyUnblockPid
-    NTSTATUS            Status;             // STATUS_SUCCESS or error
-    ULONG               ProcessId;          // PID that was unblocked (or not found)
-} RS_REPLY_UNBLOCK_PID, *PRS_REPLY_UNBLOCK_PID;
-
-//
 // ============================================================================
 // GLOBAL STATE DECLARATIONS
 // ============================================================================
 //
 
-//
-// Filter registration structure. Defined in RansomShield.c but declared
-// here so other modules can reference the filter handle.
-//
 extern PFLT_FILTER g_FilterHandle;
-
-//
-// Communication port handle. Created in CommPort.c during DriverEntry.
-// Closed during FilterUnloadCallback.
-//
 extern PFLT_PORT   g_ServerPort;
-
-//
-// Client connection port. Only one client connection is allowed at a time
-// for simplicity. A production driver would maintain a list of connected
-// clients. The filter manager already serializes ConnectNotifyCallback
-// calls, so we don't need additional locking for this pointer.
-//
 extern PFLT_PORT   g_ClientPort;
 
-//
-// Per-PID context hash table.
-//
-// DESIGN: We use a fixed-size array of LIST_ENTRY heads (buckets) with
-// separate chaining for collision resolution. This is simpler and more
-// predictable than a linked list or tree, and provides O(1) average
-// lookup with a good hash function.
-//
-// HASH FUNCTION: ProcessId % RS_HASH_TABLE_SIZE. PIDs are typically
-// well-distributed modulo powers of 2, and our table size is a prime
-// number (1021) for better distribution.
-//
-// MEMORY: All RS_PROCESS_CONTEXT nodes are in NonPagedPoolNx because
-// they are accessed under a spinlock (IRQL = DISPATCH_LEVEL).
-//
 #define RS_HASH_TABLE_SIZE      1021    // Prime number for good distribution
 
 extern LIST_ENTRY  g_ContextHashTable[RS_HASH_TABLE_SIZE];
-extern KSPIN_LOCK  g_ContextLock;       // Protects the entire hash table
-extern ULONG       g_TrackedPidCount;   // Current number of tracked PIDs
-
-//
-// Sequence number for communication messages. Incremented under
-// g_ContextLock to avoid needing a separate lock.
-//
+extern KSPIN_LOCK  g_ContextLock;
+extern ULONG       g_TrackedPidCount;
 extern ULONG       g_MessageSequence;
 
-//
-// Allowlist of image names (case-insensitive comparison).
-// Populated during DriverEntry from a static array.
-//
+// Runtime-configurable heuristic parameters (initialized from SharedDefs.h defaults).
+// Protected by g_ContextLock for both reads and writes.
+extern ULONG       g_FileCountThreshold;
+extern ULONG       g_TimeWindowSeconds;
+extern LONGLONG    g_TimeWindowTicks;
+extern BOOLEAN     g_MonitoringEnabled;
+
+// Dynamic allowlist (user-mode push, in addition to the static built-in list).
+// Array of null-terminated wide strings, protected by g_ContextLock.
+extern WCHAR       g_DynamicAllowlist[RS_MAX_ALLOWLIST_ENTRIES][RS_MAX_ALLOWLIST_NAME_LEN];
+extern ULONG       g_DynamicAllowlistCount;
+
+// Static built-in allowlist (compile-time, in .rdata — safe at DISPATCH_LEVEL).
 extern UNICODE_STRING g_Allowlist[RS_ALLOWLIST_COUNT];
 
 //
@@ -542,9 +362,33 @@ RsGetBlockedPids(
     _Out_ PULONG CountReturned
     );
 
+VOID
+RsGetPidCounts(
+    _Out_ PULONG TrackedCount,
+    _Out_ PULONG BlockedCount
+    );
+
 BOOLEAN
 RsIsProcessAllowlisted(
     _In_ PUNICODE_STRING ProcessImageName
+    );
+
+VOID
+RsApplyConfig(
+    _In_ ULONG FileCountThreshold,
+    _In_ ULONG TimeWindowSeconds,
+    _In_ BOOLEAN MonitoringEnabled
+    );
+
+VOID
+RsClearDynamicAllowlist(
+    VOID
+    );
+
+VOID
+RsAddDynamicAllowlistEntry(
+    _In_reads_(EntryLen) PWCHAR Entry,
+    _In_ ULONG EntryLen
     );
 
 //
