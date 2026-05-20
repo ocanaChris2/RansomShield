@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{C3D4E5F6-A7B8-9012-CDEF-123456789012}</ProjectGuid>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <RootNamespace>RansomShieldTray</RootNamespace>
+    <ProjectName>RansomShieldTray</ProjectName>
+  </PropertyGroup>
+
+  <!--
+    NuGet WDK/SDK property imports — must come before Microsoft.Cpp.Default.props.
+    These set $(WindowsSdkDir) and $(TargetPlatformSdkRootOverride) so headers
+    and libs are resolved from the NuGet packages rather than an installed WDK.
+  -->
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.26100.6584\build\Microsoft.Windows.SDK.cpp.props')" />
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.CPP.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.6584\build\native\Microsoft.Windows.SDK.CPP.x64.props')" />
+  <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\build\native\Microsoft.Windows.WDK.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\build\native\Microsoft.Windows.WDK.x64.props')" />
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\Tray\</IntDir>
+    <WdkVer>10.0.26100.0</WdkVer>
+    <UserModeIncludes>$(TargetPlatformSdkRootOverride)\Include\$(WdkVer)\um;$(TargetPlatformSdkRootOverride)\Include\$(WdkVer)\shared;$(TargetPlatformSdkRootOverride)\Include\$(WdkVer)\ucrt</UserModeIncludes>
+    <UserModeLibs>$(winsdk_cpp_x64_root)\um\x64;$(winsdk_cpp_x64_root)\ucrt\x64</UserModeLibs>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <Optimization>Disabled</Optimization>
+      <!--
+        _WINDOWS: marks this as a Windows-subsystem app (vs _CONSOLE).
+        WIN32_LEAN_AND_MEAN: exclude rarely-used Windows headers for faster compilation.
+      -->
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <!--
+        fltLib.lib     — FilterConnect/Send/GetMessage (driver communication)
+        advapi32.lib   — Registry, EventLog, token APIs
+        shell32.lib    — Shell_NotifyIcon, SHGetStockIconInfo, ShellExecute
+      -->
+      <AdditionalDependencies>fltLib.lib;advapi32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(UserModeLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!-- Windows subsystem: no console window; entry point is wWinMain -->
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltLib.lib;advapi32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(UserModeLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <!-- Tray-specific entry point and notification manager -->
+    <ClCompile Include="TrayMain.cpp" />
+    <ClCompile Include="NotificationManager.cpp" />
+    <!-- Shared modules reused from the CLI client (no Main.cpp) -->
+    <ClCompile Include="CommManager.cpp" />
+    <ClCompile Include="ConfigManager.cpp" />
+    <ClCompile Include="EventLogger.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="NotificationManager.h" />
+    <ClInclude Include="CommManager.h" />
+    <ClInclude Include="ConfigManager.h" />
+    <ClInclude Include="EventLogger.h" />
+    <ClInclude Include="SharedDefs.h" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>

@@ -144,7 +144,7 @@ RansomShield.sys,,,0x00000040  ; COPYFLG_OVERWRITE_OLDER_ONLY
 [RansomShield_Service_Registration]
 DisplayName    = %RansomShield.ServiceDesc%
 ServiceType    = 2               ; SERVICE_FILE_SYSTEM_DRIVER
-StartType      = 3               ; SERVICE_DEMAND_START (development)
+StartType      = 1               ; SERVICE_SYSTEM_START — loads during kernel init, before any user process
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\RansomShield.sys
 LoadOrderGroup = FSFilter Activity Monitor
