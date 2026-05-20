@@ -42,16 +42,18 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-$DriverName   = 'RansomShield'
-$DriverAlt    = '325010'
-$SysFile      = "$DriverName.sys"
-$InfFile      = "$DriverName.inf"
-$RepoRoot     = $PSScriptRoot
-$OutDir       = Join-Path $RepoRoot "x64\$Configuration"
-$SysSource    = Join-Path $OutDir $SysFile
-$InfSource    = Join-Path $RepoRoot $InfFile
-$MSBuild      = 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe'
-$SolutionDir  = "$RepoRoot\"
+$DriverName      = 'RansomShield'
+$DriverAlt       = '325010'
+$SysFile         = "$DriverName.sys"
+$InfFile         = "$DriverName.inf"
+$RepoRoot        = $PSScriptRoot
+$OutDir          = Join-Path $RepoRoot "x64\$Configuration"
+$SysSource       = Join-Path $OutDir $SysFile
+$InfSource       = Join-Path $RepoRoot $InfFile
+$ClientExe       = Join-Path $OutDir 'RansomShieldClient.exe'
+$TrayExe         = Join-Path $OutDir 'RansomShieldTray.exe'
+$MSBuild         = 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe'
+$SolutionDir     = "$RepoRoot\"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 function Write-Header([string]$msg) {
@@ -196,11 +198,36 @@ function Show-Status {
     } else {
         Write-Warn 'Service is not registered.'
     }
+
+    $trayProc = Get-Process -Name 'RansomShieldTray' -ErrorAction SilentlyContinue
+    if ($trayProc) {
+        Write-Ok "Tray agent running (PID $($trayProc.Id))"
+    } else {
+        Write-Warn 'Tray agent is not running.'
+    }
 }
 
 # ─── Build ────────────────────────────────────────────────────────────────────
+function Invoke-MSBuild([string]$vcxproj, [string]$label) {
+    if (-not (Test-Path $vcxproj)) {
+        Write-Fail "$label project not found: $vcxproj"
+        exit 1
+    }
+    Write-Host "  Building $label ..."
+    & $MSBuild $vcxproj `
+        /p:Configuration=$Configuration `
+        /p:Platform=x64 `
+        /p:"SolutionDir=$SolutionDir" `
+        /v:minimal `
+        /nologo
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "$label build failed (exit $LASTEXITCODE)."
+        exit $LASTEXITCODE
+    }
+}
+
 function Invoke-Build {
-    Write-Header "Building $DriverName ($Configuration x64)"
+    Write-Header "Building all projects ($Configuration x64)"
 
     if (-not (Test-Path $MSBuild)) {
         Write-Fail "MSBuild not found at:`n  $MSBuild"
@@ -208,25 +235,14 @@ function Invoke-Build {
         exit 1
     }
 
-    $vcxproj = Join-Path $RepoRoot "$DriverName.vcxproj"
-    if (-not (Test-Path $vcxproj)) {
-        Write-Fail "$DriverName.vcxproj not found in repo root."
-        exit 1
-    }
+    Invoke-MSBuild (Join-Path $RepoRoot "$DriverName.vcxproj")         'RansomShield (driver)'
+    Write-Ok "Driver built      → $SysSource"
 
-    & $MSBuild $vcxproj `
-        /p:Configuration=$Configuration `
-        /p:Platform=x64 `
-        /p:"SolutionDir=$SolutionDir" `
-        /v:minimal `
-        /nologo
+    Invoke-MSBuild (Join-Path $RepoRoot 'RansomShieldClient.vcxproj')  'RansomShieldClient'
+    Write-Ok "Client built      → $ClientExe"
 
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "Build failed (exit $LASTEXITCODE)."
-        exit $LASTEXITCODE
-    }
-
-    Write-Ok "Build succeeded → $SysSource"
+    Invoke-MSBuild (Join-Path $RepoRoot 'RansomShieldTray.vcxproj')    'RansomShieldTray'
+    Write-Ok "Tray agent built  → $TrayExe"
 }
 
 # ─── Install ──────────────────────────────────────────────────────────────────
@@ -245,7 +261,9 @@ function Invoke-Install {
     }
 
     # ── Step 1: stop + unload any running instance ────────────────────────────
-    # Kill user-mode client first so comm port handles are released.
+    # Kill user-mode processes first so the comm port handle is released.
+    Get-Process -Name 'RansomShieldTray'   -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
     Get-Process -Name 'RansomShieldClient' -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 400
@@ -334,11 +352,37 @@ function Invoke-Install {
     Write-Ok "Driver loaded: $loadOut"
 
     Show-Status
+
+    # Launch tray agent so monitoring begins immediately after install.
+    if (Test-Path $TrayExe) {
+        Write-Header 'Starting tray agent'
+        Start-Process $TrayExe -Verb RunAs
+        Write-Ok "RansomShieldTray launched (runs as a background tray icon)."
+        Write-Host "  Right-click the shield icon in the system tray to manage the driver." -ForegroundColor DarkGray
+    } else {
+        Write-Warn "RansomShieldTray.exe not found at $TrayExe — build it with -Action build."
+    }
 }
 
 # ─── Uninstall ────────────────────────────────────────────────────────────────
 function Invoke-Uninstall {
     Write-Header 'Uninstalling driver'
+
+    # Stop tray agent and release the comm port handle before unloading.
+    $trayProc = Get-Process -Name 'RansomShieldTray' -ErrorAction SilentlyContinue
+    if ($trayProc) {
+        $trayProc | Stop-Process -Force -ErrorAction SilentlyContinue
+        Write-Ok 'Tray agent stopped.'
+    }
+    Get-Process -Name 'RansomShieldClient' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # Remove auto-start registry entry if present (HKCU, no elevation needed).
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (Get-ItemProperty $runKey -Name 'RansomShieldTray' -ErrorAction SilentlyContinue) {
+        Remove-ItemProperty $runKey -Name 'RansomShieldTray' -ErrorAction SilentlyContinue
+        Write-Ok 'Removed tray auto-start registry entry.'
+    }
 
     # Unload if running
     $running = Get-DriverStatus
