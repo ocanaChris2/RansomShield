@@ -30,7 +30,13 @@ $msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Curren
 & $msbuild RansomShieldClient.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir="$PWD\"
 ```
 
-**Build both together** via solution:
+**Build tray agent** → `x64\Debug\RansomShieldTray.exe`:
+```powershell
+& $msbuild RansomShieldTray.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:SolutionDir="$PWD\"
+& $msbuild RansomShieldTray.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir="$PWD\"
+```
+
+**Build all three together** via solution:
 ```powershell
 & $msbuild RansomShield.sln /p:Configuration=Debug /p:Platform=x64
 ```
@@ -79,7 +85,7 @@ Kernel↔user channel via FltMgr port at `\RansomShieldPort`.
 | `CommPort.c` | FltMgr communication port setup and message dispatch |
 | `RansomShield.h` | All kernel types, constants, and function declarations |
 
-### User-Mode Client
+### User-Mode Client (`RansomShieldClient.exe`)
 
 | File | Responsibility |
 |---|---|
@@ -88,6 +94,21 @@ Kernel↔user channel via FltMgr port at `\RansomShieldPort`.
 | `ConfigManager.h/.cpp` | Registry persistence under `HKLM\...\RansomShield\Config` |
 | `EventLogger.h/.cpp` | Windows Event Log via `ReportEvent` |
 | `SharedDefs.h` | All protocol structures shared between kernel and user mode |
+
+### Tray Agent (`RansomShieldTray.exe`)
+
+Windows-subsystem background application (no console window). Reuses `CommManager`, `ConfigManager`, and `EventLogger` from the CLI client.
+
+| File | Responsibility |
+|---|---|
+| `TrayMain.cpp` | `WinMain` entry point, hidden message window, WndProc, 5 s reconnect timer |
+| `NotificationManager.h/.cpp` | `Shell_NotifyIcon` tray icon (UAC shield), thread-safe alert queue, `NIIF_WARNING` balloon tips, right-click context menu, HKCU auto-start toggle |
+
+**Key design points:**
+- The comm port allows only one client — while the tray is running it holds the connection; CLI commands that need the port must be run after stopping the tray.
+- Listener thread pushes `RsAlertData` to a `std::queue` (mutex-protected) and calls `PostMessage(WM_RSBLOCKED)` to marshal to the main thread, which shows the balloon.
+- Single-instance guard via named mutex (`Global\RansomShieldTrayMutex_3F7A`).
+- Driver start type is `SERVICE_SYSTEM_START` (1) — set in `RansomShield.inf` and applied with `sc config RansomShield start= system`.
 
 `CommManager` runs a background thread calling `FilterGetMessage()` in a loop to receive driver push notifications. `ConfigManager` persists thresholds and allowlist to registry; `PushToDriver()` sends them via chunked allowlist messages.
 

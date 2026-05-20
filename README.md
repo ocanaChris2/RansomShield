@@ -1,6 +1,6 @@
 # RansomShield
 
-A Windows kernel-mode minifilter driver that detects and blocks ransomware in real time, paired with a user-mode control client for monitoring and configuration.
+A Windows kernel-mode minifilter driver that detects and blocks ransomware in real time, paired with a user-mode control client and a background tray agent that shows live Windows notifications when a process is blocked.
 
 ## How it works
 
@@ -22,27 +22,34 @@ A **per-PID heuristic engine** tracks every file operation using a sliding time 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│               User Mode                         │
-│                                                 │
-│  RansomShieldClient.exe                         │
-│  ├─ Main.cpp          CLI + 60 s health loop    │
-│  ├─ CommManager       FilterConnect/Send/Get    │
-│  ├─ ConfigManager     registry persistence      │
-│  └─ EventLogger       Windows Event Log         │
-│                                                 │
-│         FilterSendMessage / FilterGetMessage    │
-└──────────────────────┬──────────────────────────┘
-                       │  \RansomShieldPort
-┌──────────────────────▼──────────────────────────┐
-│               Kernel Mode                       │
-│                                                 │
-│  RansomShield.sys  (minifilter @ alt 325010)    │
-│  ├─ RansomShield.c   DriverEntry, callbacks     │
-│  ├─ Context.c        per-PID hash table         │
-│  └─ CommPort.c       FltMgr port dispatch       │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        User Mode                                │
+│                                                                 │
+│  RansomShieldTray.exe  (background, no console)                 │
+│  ├─ TrayMain.cpp         WinMain, message loop, reconnect timer │
+│  ├─ NotificationManager  Shell_NotifyIcon + balloon tips        │
+│  ├─ CommManager          FilterConnect/Send/Get                 │
+│  ├─ ConfigManager        registry persistence                   │
+│  └─ EventLogger          Windows Event Log + file log           │
+│                                                                 │
+│  RansomShieldClient.exe  (CLI / one-shot commands)              │
+│  ├─ Main.cpp             argument dispatch, daemon loop         │
+│  └─  ↑ shares CommManager, ConfigManager, EventLogger          │
+│                                                                 │
+│         FilterSendMessage / FilterGetMessage                    │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │  \RansomShieldPort  (1 client max)
+┌──────────────────────────────▼──────────────────────────────────┐
+│                       Kernel Mode                               │
+│                                                                 │
+│  RansomShield.sys  (minifilter @ alt 325010)                    │
+│  ├─ RansomShield.c   DriverEntry, callbacks                     │
+│  ├─ Context.c        per-PID hash table                         │
+│  └─ CommPort.c       FltMgr port dispatch                       │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+> **One connection at a time.** While `RansomShieldTray.exe` is running it holds the only allowed connection to `\RansomShieldPort`. Stop the tray agent before using CLI commands that also connect to the driver.
 
 ### Heuristic engine (`Context.c`)
 
@@ -123,13 +130,14 @@ typedef struct _RS_NOTIFICATION_BLOCKED_PID {
 # 1. Restore WDK NuGet packages (one-time)
 .\nuget.exe restore RansomShield.sln -PackagesDirectory packages
 
-# 2. Build driver + client (Debug x64)
+# 2. Build all three projects (Debug x64)
 $msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
 & $msbuild RansomShield.sln /p:Configuration=Debug /p:Platform=x64
 
 # Outputs:
-#   x64\Debug\RansomShield.sys       ← kernel driver
-#   x64\Debug\RansomShieldClient.exe ← user-mode client
+#   x64\Debug\RansomShield.sys          ← kernel driver
+#   x64\Debug\RansomShieldClient.exe    ← CLI control client
+#   x64\Debug\RansomShieldTray.exe      ← background tray agent
 ```
 
 NuGet packages used:
@@ -241,6 +249,8 @@ The driver is built as `ConfigurationType=DynamicLibrary` (not the WDK "Driver" 
 
 ### Step 3 — Build the user-mode client (`RansomShieldClient.exe`)
 
+
+
 ```powershell
 $msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
 
@@ -278,14 +288,50 @@ The client is a standard C++17 console application (`ConfigurationType=Applicati
 
 ---
 
-### Step 4 — Build both together (recommended)
+### Step 4 — Build the tray agent (`RansomShieldTray.exe`)
+
+```powershell
+$msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
+
+# Debug
+& $msbuild RansomShieldTray.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:SolutionDir="$PWD\" /v:minimal /nologo
+
+# Release
+& $msbuild RansomShieldTray.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir="$PWD\" /v:minimal /nologo
+```
+
+**Output:** `x64\Debug\RansomShieldTray.exe` or `x64\Release\RansomShieldTray.exe`
+
+#### What the tray project does internally
+
+`RansomShieldTray` is a Windows-subsystem application (no console window). It reuses `CommManager`, `ConfigManager`, and `EventLogger` from the CLI client — the only new files are `TrayMain.cpp` (entry point and window procedure) and `NotificationManager.h/.cpp` (tray icon and balloon tips).
+
+| Setting | Value |
+|---------|-------|
+| Subsystem | `Windows` (no console, `wWinMain` entry point) |
+| Preprocessor | `_WINDOWS` instead of `_CONSOLE` |
+| Extra lib | `shell32.lib` — for `Shell_NotifyIcon`, `SHGetStockIconInfo`, `ShellExecuteW` |
+| Icon | System shield icon (`SIID_SHIELD`) via `SHGetStockIconInfo` |
+
+**Troubleshooting — tray build errors:**
+
+| Error message | Cause | Fix |
+|---------------|-------|-----|
+| `fatal error C1083: Cannot open include file: 'shellapi.h'` | SDK.CPP NuGet package not restored | Run `.\nuget.exe restore RansomShield.sln -PackagesDirectory packages` |
+| `error LNK2019: unresolved external symbol Shell_NotifyIconW` | `shell32.lib` missing from linker deps | Confirm `shell32.lib` is listed in `<AdditionalDependencies>` in `RansomShieldTray.vcxproj` |
+| `error LNK2019: unresolved external symbol _wWinMain` | Source file defines `wmain` instead of `wWinMain`, or subsystem mismatch | `TrayMain.cpp` must define `int WINAPI wWinMain(...)` and the vcxproj must have `<SubSystem>Windows</SubSystem>` |
+| Application flashes a console window on launch | Project built with `SubSystem=Console` instead of `Windows` | Rebuild after confirming `<SubSystem>Windows</SubSystem>` in both Debug and Release `<Link>` sections |
+
+---
+
+### Step 5 — Build all three together (recommended)
 
 ```powershell
 $msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
 & $msbuild RansomShield.sln /p:Configuration=Debug /p:Platform=x64 /v:minimal /nologo
 ```
 
-When building through the `.sln`, MSBuild sets `$(SolutionDir)` automatically — no need to pass it explicitly.
+When building through the `.sln`, MSBuild sets `$(SolutionDir)` automatically — no need to pass it explicitly. All three projects build in a single invocation.
 
 ---
 
@@ -312,9 +358,12 @@ When building through the `.sln`, MSBuild sets `$(SolutionDir)` automatically �
 
 The script automatically:
 - Verifies test signing (`bcdedit /set testsigning on`) and HVCI status.
+- Builds all three projects: driver, CLI client, and tray agent.
 - Creates or reuses a self-signed code-signing certificate (`CN=RansomShield Test Signing`).
 - Trusts the cert in `LocalMachine\Root` and `LocalMachine\TrustedPublisher`.
 - Copies the binary to `%SystemRoot%\System32\drivers\`, writes service registry entries directly (avoids `sc.exe` pending-deletion race), and calls `fltmc load`.
+- Launches `RansomShieldTray.exe` automatically after a successful install so monitoring begins immediately.
+- On uninstall: stops the tray agent, removes the auto-start registry entry, unloads and deletes the driver service.
 
 ### Manual steps
 
@@ -328,9 +377,24 @@ rundll32.exe setupapi.dll,InstallHinfSection DefaultInstall 132 .\RansomShield.i
 :: 3. Verify the filter is loaded at altitude 325010
 fltmc
 
-:: 4. Unload
+:: 4. Start the tray agent (as Administrator)
+x64\Debug\RansomShieldTray.exe
+
+:: 5. Unload driver
 fltmc unload RansomShield
 ```
+
+### Driver auto-start
+
+The INF registers the driver with `StartType = 1` (`SERVICE_SYSTEM_START`), so it loads automatically during kernel initialization on every boot — before any user process can run. To apply this to an already-installed driver without reinstalling:
+
+```cmd
+sc config RansomShield start= system
+```
+
+### Tray agent auto-start
+
+The tray agent auto-start is managed from its own context menu (right-click the shield icon → **Start with Windows**). This writes the executable path to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` so it launches on user login. The deploy script's `-Action uninstall` removes this entry automatically.
 
 ### Deploy troubleshooting
 
@@ -398,16 +462,40 @@ The script: unloads the filter (`fltmc unload`), stops and deletes the SCM servi
 
 ## File map
 
+**Kernel driver**
+
 | File | Role |
 |------|------|
 | `RansomShield.c` | `DriverEntry`, filter registration, IRP callbacks |
 | `Context.c` | Per-PID hash table, heuristic evaluation, allowlist |
 | `CommPort.c` | FltMgr communication port setup and message dispatch |
 | `RansomShield.h` | All kernel types, constants, and function declarations |
-| `SharedDefs.h` | Protocol structures shared between kernel and user mode |
+
+**Shared**
+
+| File | Role |
+|------|------|
+| `SharedDefs.h` | Protocol structures and message types shared between kernel and user mode |
+| `CommManager.h/.cpp` | Singleton; wraps `FilterConnect/Send/GetMessage`; background listener thread |
+| `ConfigManager.h/.cpp` | Registry persistence for thresholds and allowlist |
+| `EventLogger.h/.cpp` | Windows Event Log + local file log |
+
+**CLI client (`RansomShieldClient.exe`)**
+
+| File | Role |
+|------|------|
 | `Main.cpp` | CLI argument dispatch, daemon loop with 60 s health checks |
-| `CommManager.h/.cpp` | Singleton; wraps `FilterConnect/Send/GetMessage`; listener thread |
-| `ConfigManager.h/.cpp` | Registry persistence |
-| `EventLogger.h/.cpp` | Windows Event Log via `ReportEvent` |
-| `Deploy-RansomShield.ps1` | Build, sign, install, and uninstall automation |
-| `RansomShield.inf` | Driver installation descriptor (altitude 325010) |
+
+**Tray agent (`RansomShieldTray.exe`)**
+
+| File | Role |
+|------|------|
+| `TrayMain.cpp` | `WinMain`, hidden message window, WndProc, reconnect timer |
+| `NotificationManager.h/.cpp` | `Shell_NotifyIcon` tray icon, balloon-tip alerts, right-click context menu, auto-start toggle |
+
+**Deployment**
+
+| File | Role |
+|------|------|
+| `Deploy-RansomShield.ps1` | Build all three projects, self-sign, install driver, launch tray agent; uninstall support |
+| `RansomShield.inf` | Driver installation descriptor — altitude 325010, `StartType = 1` (system-start) |
