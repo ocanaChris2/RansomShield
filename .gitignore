@@ -25,3 +25,6 @@ nuget.exe
 *.VC.db
 *.VC.opendb
 ipch/
+
+# Claude Code local config
+.claude/
