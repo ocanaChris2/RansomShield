@@ -28,3 +28,4 @@ ipch/
 
 # Claude Code local config
 .claude/
+CLAUDE.md
