@@ -53,13 +53,12 @@ Author:
 #include <string>
 #include <vector>
 #include <mutex>
+#include "SharedDefs.h"
 
 class ConfigManager {
 public:
-    //
-    // Get the singleton instance.
-    //
-    static ConfigManager& Instance();
+    // registryBasePath — HKLM sub-key root (e.g. RS_REGISTRY_BASE_PATH).
+    explicit ConfigManager(const wchar_t* registryBasePath);
 
     ~ConfigManager();
 
@@ -125,21 +124,7 @@ public:
     //
     bool LoadFromRegistry();
 
-    // ─── Driver Sync ────────────────────────────────────────────────
-
-    //
-    // Push the current configuration and allowlist to the driver.
-    // This should be called:
-    //   1. On startup, after loading from the registry.
-    //   2. After any configuration change.
-    //   3. After any allowlist change.
-    //
-    // Requires CommManager to be connected.
-    //
-    bool PushToDriver();
-
 private:
-    ConfigManager();
     ConfigManager(const ConfigManager&) = delete;
     ConfigManager& operator=(const ConfigManager&) = delete;
 
@@ -197,4 +182,6 @@ private:
     //
     HKEY m_hConfigKey;
     HKEY m_hAllowlistKey;
+
+    std::wstring m_registryBasePath;
 };

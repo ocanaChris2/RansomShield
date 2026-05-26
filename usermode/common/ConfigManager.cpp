@@ -45,27 +45,17 @@ Author:
 --*/
 
 #include "ConfigManager.h"
-#include "CommManager.h"
 #include <algorithm>
 #include <cwchar>
 
-// ============================================================================
-// SINGLETON
-// ============================================================================
-
-ConfigManager& ConfigManager::Instance()
-{
-    static ConfigManager instance;
-    return instance;
-}
-
-ConfigManager::ConfigManager()
+ConfigManager::ConfigManager(const wchar_t* registryBasePath)
     : m_fileCountThreshold(RS_DEFAULT_FILE_COUNT_THRESHOLD)
     , m_timeWindowSeconds(RS_DEFAULT_TIME_WINDOW_SECONDS)
     , m_monitoringEnabled(RS_DEFAULT_MONITORING_ENABLED)
     , m_initialized(false)
     , m_hConfigKey(NULL)
     , m_hAllowlistKey(NULL)
+    , m_registryBasePath(registryBasePath)
 {
 }
 
@@ -104,8 +94,8 @@ bool ConfigManager::Initialize()
     // KEY_ALL_ACCESS gives us read/write/create permissions.
     // This requires the process to be running as Administrator or SYSTEM.
     //
-    std::wstring configPath = std::wstring(RS_REGISTRY_BASE_PATH) + L"\\" + RS_REGISTRY_CONFIG_KEY;
-    std::wstring allowlistPath = std::wstring(RS_REGISTRY_BASE_PATH) + L"\\" + RS_REGISTRY_ALLOWLIST_KEY;
+    std::wstring configPath    = m_registryBasePath + L"\\" + RS_REGISTRY_CONFIG_KEY;
+    std::wstring allowlistPath = m_registryBasePath + L"\\" + RS_REGISTRY_ALLOWLIST_KEY;
 
     if (!OpenOrCreateKey(HKEY_LOCAL_MACHINE, configPath.c_str(), &m_hConfigKey)) {
         fwprintf(stderr, L"RansomShield: Failed to open/create Config registry key.\n");
@@ -431,58 +421,6 @@ bool ConfigManager::LoadFromRegistry()
     }
 
     wprintf(L"RansomShield: Configuration reloaded from registry.\n");
-    return true;
-}
-
-// ============================================================================
-// DRIVER SYNC
-// ============================================================================
-
-bool ConfigManager::PushToDriver()
-{
-    //
-    // Push the current configuration and allowlist to the driver.
-    // This requires CommManager to be connected.
-    //
-    if (!CommManager::Instance().IsConnected()) {
-        fwprintf(stderr, L"RansomShield: Cannot push to driver — not connected.\n");
-        return false;
-    }
-
-    //
-    // Read current config values (under lock, then release).
-    //
-    ULONG threshold, timeWindow;
-    bool monitoring;
-    std::vector<std::wstring> allowlist;
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        threshold = m_fileCountThreshold;
-        timeWindow = m_timeWindowSeconds;
-        monitoring = m_monitoringEnabled;
-        allowlist = m_allowlist;
-    }
-
-    //
-    // Push configuration.
-    //
-    HRESULT hr = CommManager::Instance().UpdateConfig(threshold, timeWindow, monitoring ? TRUE : FALSE);
-    if (FAILED(hr)) {
-        fwprintf(stderr, L"RansomShield: Failed to push config to driver: 0x%08X\n", hr);
-        return false;
-    }
-
-    //
-    // Push allowlist.
-    //
-    hr = CommManager::Instance().PushAllowlist(allowlist);
-    if (FAILED(hr)) {
-        fwprintf(stderr, L"RansomShield: Failed to push allowlist to driver: 0x%08X\n", hr);
-        return false;
-    }
-
-    wprintf(L"RansomShield: Configuration and allowlist pushed to driver.\n");
     return true;
 }
 

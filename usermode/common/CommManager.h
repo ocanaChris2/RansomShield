@@ -70,12 +70,8 @@ using NotificationCallback = std::function<void(const BYTE* data, DWORD dataSize
 
 class CommManager {
 public:
-    //
-    // Get the singleton instance. The CommManager is a singleton because
-    // the driver only supports one client connection at a time
-    // (MaxConnections = 1 in FltCreateCommunicationPort).
-    //
-    static CommManager& Instance();
+    // portName — the FltMgr port name to connect to (e.g. RS_PORT_NAME).
+    explicit CommManager(const wchar_t* portName);
 
     //
     // Destructor ensures clean disconnection and thread shutdown.
@@ -215,14 +211,6 @@ public:
     );
 
 private:
-    //
-    // Private constructor (singleton pattern).
-    //
-    CommManager();
-
-    //
-    // Delete copy/move constructors (singleton).
-    //
     CommManager(const CommManager&) = delete;
     CommManager& operator=(const CommManager&) = delete;
 
@@ -270,4 +258,6 @@ private:
     // Not thread-safe by itself, but only accessed under m_mutex.
     //
     ULONG m_sequenceNumber;
+
+    std::wstring m_portName;
 };

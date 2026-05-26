@@ -1,6 +1,6 @@
 /*++
 Module Name:
-    CommPort.c
+    RsCommPort.c
 
 Abstract:
     User-mode communication port module for the RansomShield minifilter driver.

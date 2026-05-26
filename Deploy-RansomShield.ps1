@@ -377,12 +377,13 @@ function Invoke-Uninstall {
     Get-Process -Name 'RansomShieldClient' -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
 
-    # Remove auto-start registry entry if present (HKCU, no elevation needed).
+    # Remove auto-start Task Scheduler task (new mechanism, elevated logon trigger).
+    Unregister-ScheduledTask -TaskName 'RansomShieldTray' -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Ok 'Removed tray auto-start scheduled task (if present).'
+
+    # Remove legacy HKCU Run entry in case the old version was installed.
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-    if (Get-ItemProperty $runKey -Name 'RansomShieldTray' -ErrorAction SilentlyContinue) {
-        Remove-ItemProperty $runKey -Name 'RansomShieldTray' -ErrorAction SilentlyContinue
-        Write-Ok 'Removed tray auto-start registry entry.'
-    }
+    Remove-ItemProperty $runKey -Name 'RansomShieldTray' -ErrorAction SilentlyContinue
 
     # Unload if running
     $running = Get-DriverStatus

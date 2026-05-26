@@ -63,21 +63,12 @@ Author:
 #include "CommManager.h"
 #include <cstdio>
 
-// ============================================================================
-// SINGLETON
-// ============================================================================
-
-CommManager& CommManager::Instance()
-{
-    static CommManager instance;
-    return instance;
-}
-
-CommManager::CommManager()
+CommManager::CommManager(const wchar_t* portName)
     : m_hPort(INVALID_HANDLE_VALUE)
     , m_connected(false)
     , m_listenerRunning(false)
     , m_sequenceNumber(0)
+    , m_portName(portName)
 {
 }
 
@@ -124,7 +115,7 @@ HRESULT CommManager::Connect()
     //
     HANDLE hPort = INVALID_HANDLE_VALUE;
     HRESULT hr = FilterConnectCommunicationPort(
-        RS_PORT_NAME,
+        m_portName.c_str(),
         0,                  // dwOptions (reserved)
         NULL,               // lpContext
         0,                  // dwContextSize

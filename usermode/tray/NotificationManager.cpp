@@ -8,8 +8,11 @@ Abstract:
 --*/
 
 #include "NotificationManager.h"
-#include "CommManager.h"
 #include <strsafe.h>
+#include <objbase.h>    // CoInitializeEx / CoCreateInstance / CoUninitialize
+#include <taskschd.h>   // ITaskService, ITaskFolder, IRegisteredTask
+#include <oleauto.h>    // SysAllocString / SysFreeString
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Singleton
@@ -49,6 +52,19 @@ bool NotificationManager::Initialize(HINSTANCE hInst, HWND hwnd) {
                    L"RansomShield — Connecting to driver...");
 
     AddTrayIcon();
+
+    // Remove legacy HKCU Run entry that launched the tray without elevation.
+    // The new mechanism uses a Task Scheduler task with HighestAvailable RunLevel.
+    {
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, L"RansomShieldTray");
+            RegCloseKey(hKey);
+        }
+    }
+
     m_initialized = true;
     return true;
 }
@@ -195,41 +211,140 @@ void NotificationManager::ShowContextMenu() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-start (HKCU Run key, no elevation needed)
+// Auto-start via Windows Task Scheduler (runs elevated at logon)
 // ---------------------------------------------------------------------------
 
+static constexpr wchar_t TASK_NAME[] = L"RansomShieldTray";
+
+// Returns DOMAIN\Username for the current process token (used in task XML).
+static std::wstring GetCurrentUserSamName() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return {};
+
+    DWORD needed = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &needed);
+    std::vector<BYTE> buf(needed);
+    BOOL ok = GetTokenInformation(hToken, TokenUser, buf.data(), needed, &needed);
+    CloseHandle(hToken);
+    if (!ok) return {};
+
+    const auto* tu = reinterpret_cast<const TOKEN_USER*>(buf.data());
+    wchar_t name[256] = {}, domain[256] = {};
+    DWORD nameLen = ARRAYSIZE(name), domainLen = ARRAYSIZE(domain);
+    SID_NAME_USE use = SidTypeUnknown;
+    if (!LookupAccountSidW(nullptr, tu->User.Sid, name, &nameLen, domain, &domainLen, &use))
+        return {};
+    return std::wstring(domain) + L"\\" + name;
+}
+
+// Connects to the local Task Scheduler service. Caller releases *ppSvc.
+static HRESULT ConnectTaskService(ITaskService** ppSvc) {
+    HRESULT hr = CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_ITaskService, reinterpret_cast<void**>(ppSvc));
+    if (FAILED(hr)) return hr;
+    VARIANT empty = {};
+    return (*ppSvc)->Connect(empty, empty, empty, empty);
+}
+
 bool NotificationManager::IsAutoStartEnabled() const {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, KEY_READ, &hKey) != ERROR_SUCCESS) {
-        return false;
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    ITaskService* svc = nullptr;
+    bool found = false;
+
+    if (SUCCEEDED(ConnectTaskService(&svc))) {
+        ITaskFolder* folder = nullptr;
+        BSTR root = SysAllocString(L"\\");
+        if (SUCCEEDED(svc->GetFolder(root, &folder))) {
+            IRegisteredTask* task = nullptr;
+            BSTR tname = SysAllocString(TASK_NAME);
+            found = SUCCEEDED(folder->GetTask(tname, &task));
+            SysFreeString(tname);
+            if (task) task->Release();
+            folder->Release();
+        }
+        SysFreeString(root);
+        svc->Release();
     }
-    bool found = (RegQueryValueExW(hKey, L"RansomShieldTray",
-                                   nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS);
-    RegCloseKey(hKey);
+
+    if (hrCo == S_OK) CoUninitialize();
     return found;
 }
 
 void NotificationManager::ToggleAutoStart() {
     bool enable = !IsAutoStartEnabled();
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+    ITaskService* svc = nullptr;
+    if (FAILED(ConnectTaskService(&svc))) {
+        if (hrCo == S_OK) CoUninitialize();
         return;
     }
 
-    if (enable) {
-        wchar_t path[MAX_PATH];
-        GetModuleFileNameW(nullptr, path, MAX_PATH);
-        RegSetValueExW(hKey, L"RansomShieldTray", 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(path),
-                       static_cast<DWORD>((wcslen(path) + 1) * sizeof(wchar_t)));
-    } else {
-        RegDeleteValueW(hKey, L"RansomShieldTray");
+    ITaskFolder* folder = nullptr;
+    BSTR root = SysAllocString(L"\\");
+    HRESULT hr = svc->GetFolder(root, &folder);
+    SysFreeString(root);
+    svc->Release();
+    if (FAILED(hr)) {
+        if (hrCo == S_OK) CoUninitialize();
+        return;
     }
 
-    RegCloseKey(hKey);
+    BSTR taskName = SysAllocString(TASK_NAME);
+
+    if (enable) {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring user = GetCurrentUserSamName();
+        if (user.empty()) {
+            SysFreeString(taskName);
+            folder->Release();
+            if (hrCo == S_OK) CoUninitialize();
+            return;
+        }
+
+        // Logon trigger + HighestAvailable so the tray starts elevated automatically.
+        wchar_t xml[4096] = {};
+        StringCchPrintfW(xml, ARRAYSIZE(xml),
+            L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>"
+            L"<Task version=\"1.2\""
+            L" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            L"<Triggers>"
+            L"<LogonTrigger><UserId>%s</UserId></LogonTrigger>"
+            L"</Triggers>"
+            L"<Principals><Principal id=\"Author\">"
+            L"<UserId>%s</UserId>"
+            L"<LogonType>InteractiveToken</LogonType>"
+            L"<RunLevel>HighestAvailable</RunLevel>"
+            L"</Principal></Principals>"
+            L"<Settings>"
+            L"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+            L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+            L"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+            L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"
+            L"</Settings>"
+            L"<Actions Context=\"Author\">"
+            L"<Exec><Command>%s</Command></Exec>"
+            L"</Actions>"
+            L"</Task>",
+            user.c_str(), user.c_str(), exePath);
+
+        VARIANT vtEmpty = {};
+        BSTR xmlStr = SysAllocString(xml);
+        IRegisteredTask* task = nullptr;
+        folder->RegisterTask(taskName, xmlStr,
+                             TASK_CREATE_OR_UPDATE,
+                             vtEmpty, vtEmpty,
+                             TASK_LOGON_INTERACTIVE_TOKEN,
+                             vtEmpty, &task);
+        SysFreeString(xmlStr);
+        if (task) task->Release();
+    } else {
+        folder->DeleteTask(taskName, 0);
+    }
+
+    SysFreeString(taskName);
+    folder->Release();
+    if (hrCo == S_OK) CoUninitialize();
 }

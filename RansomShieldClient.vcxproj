@@ -76,7 +76,7 @@
       <TreatWarningAsError>false</TreatWarningAsError>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)sdk;$(SolutionDir)usermode\common;$(SolutionDir)usermode\cli;$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
@@ -98,7 +98,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)sdk;$(SolutionDir)usermode\common;$(SolutionDir)usermode\cli;$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
     </ClCompile>
@@ -113,18 +113,20 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="Main.cpp" />
-    <ClCompile Include="CommManager.cpp" />
-    <ClCompile Include="ConfigManager.cpp" />
-    <ClCompile Include="EventLogger.cpp" />
+    <ClCompile Include="usermode\cli\Main.cpp" />
+    <ClCompile Include="usermode\common\RansomShieldModule.cpp" />
+    <ClCompile Include="usermode\common\CommManager.cpp" />
+    <ClCompile Include="usermode\common\ConfigManager.cpp" />
+    <ClCompile Include="usermode\common\EventLogger.cpp" />
   </ItemGroup>
 
   <ItemGroup>
-    <ClInclude Include="CommManager.h" />
-    <ClInclude Include="ConfigManager.h" />
-    <ClInclude Include="EventLogger.h" />
-    <ClInclude Include="SharedDefs.h" />
-    <ClInclude Include="RansomShieldClient.h" />
+    <ClInclude Include="sdk\IProtectionModule.h" />
+    <ClInclude Include="usermode\common\RansomShieldModule.h" />
+    <ClInclude Include="usermode\common\CommManager.h" />
+    <ClInclude Include="usermode\common\ConfigManager.h" />
+    <ClInclude Include="usermode\common\EventLogger.h" />
+    <ClInclude Include="usermode\common\SharedDefs.h" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

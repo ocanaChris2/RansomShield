@@ -42,20 +42,11 @@ Author:
 #include <cstdio>
 #include <ctime>
 
-// ============================================================================
-// SINGLETON
-// ============================================================================
-
-EventLogger& EventLogger::Instance()
-{
-    static EventLogger instance;
-    return instance;
-}
-
-EventLogger::EventLogger()
+EventLogger::EventLogger(const wchar_t* sourceName)
     : m_hEventLog(NULL)
     , m_hLogFile(INVALID_HANDLE_VALUE)
     , m_initialized(false)
+    , m_sourceName(sourceName)
 {
 }
 
@@ -96,7 +87,7 @@ bool EventLogger::Initialize()
     // A production installer should create this registry key and point
     // it to the event message file (.dll compiled from .mc).
     //
-    m_hEventLog = RegisterEventSourceW(NULL, RS_EVENT_LOG_SOURCE);
+    m_hEventLog = RegisterEventSourceW(NULL, m_sourceName.c_str());
 
     if (m_hEventLog == NULL) {
         fwprintf(stderr, L"RansomShield: RegisterEventSourceW failed: %lu\n", GetLastError());

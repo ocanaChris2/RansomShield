@@ -37,10 +37,12 @@ Author:
 
 #include <Windows.h>
 #include <string>
+#include <stdarg.h>
 
 class EventLogger {
 public:
-    static EventLogger& Instance();
+    // sourceName — Windows Event Log source name (e.g. RS_EVENT_LOG_SOURCE).
+    explicit EventLogger(const wchar_t* sourceName);
     ~EventLogger();
 
     //
@@ -118,7 +120,6 @@ public:
     );
 
 private:
-    EventLogger();
     EventLogger(const EventLogger&) = delete;
     EventLogger& operator=(const EventLogger&) = delete;
 
@@ -153,4 +154,6 @@ private:
     // Whether Initialize() has been called.
     //
     bool m_initialized;
+
+    std::wstring m_sourceName;
 };

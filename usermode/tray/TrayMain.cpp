@@ -33,31 +33,29 @@ Author:
 #include <shellapi.h>
 #include <strsafe.h>
 
-#include "SharedDefs.h"
-#include "CommManager.h"
-#include "ConfigManager.h"
-#include "EventLogger.h"
+#include "../common/RansomShieldModule.h"
 #include "NotificationManager.h"
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-static constexpr UINT       ID_TIMER_HEALTH = 1;
-static constexpr UINT       HEALTH_INTERVAL_MS = 5000;   // 5 s poll
-static constexpr int        HEALTH_TICKS_PER_QUERY = 12; // 12 * 5 s = 60 s
+static constexpr UINT       ID_TIMER_HEALTH     = 1;
+static constexpr UINT       HEALTH_INTERVAL_MS  = 5000;
+static constexpr int        HEALTH_TICKS_PER_QUERY = 12;
 
-static constexpr wchar_t    WINDOW_CLASS[]  = L"RansomShieldTrayWnd";
-static constexpr wchar_t    MUTEX_NAME[]    = L"Global\\RansomShieldTrayMutex_3F7A";
+static constexpr wchar_t    WINDOW_CLASS[] = L"RansomShieldTrayWnd";
+static constexpr wchar_t    MUTEX_NAME[]   = L"Global\\RansomShieldTrayMutex_3F7A";
 
 // ============================================================================
 // Module-level state
 // ============================================================================
 
+static RansomShieldModule g_module;
 static int s_healthTick = 0;
 
 // ============================================================================
-// Privilege check (same logic as RansomShieldClient)
+// Privilege check
 // ============================================================================
 
 static bool IsElevated() {
@@ -89,20 +87,18 @@ static void ListenerCallback(const BYTE* data, DWORD dataSize) {
         const RS_NOTIFICATION_BLOCKED_PID* n =
             reinterpret_cast<const RS_NOTIFICATION_BLOCKED_PID*>(data);
 
-        // Queue balloon for the main thread and write to the event/file log.
         NotificationManager::Instance().QueueAlert(
             n->ProcessId, n->ImageName, n->OperationCount);
 
-        EventLogger::Instance().LogRansomwareDetected(
+        g_module.Logger().LogRansomwareDetected(
             n->ProcessId, n->ImageName, n->OperationCount);
     }
-    // Config / allowlist acknowledgements are informational; log only.
     else if (hdr->MessageType == RsNotifyConfigUpdated &&
              dataSize >= sizeof(RS_NOTIFICATION_CONFIG_UPDATED)) {
 
         const RS_NOTIFICATION_CONFIG_UPDATED* n =
             reinterpret_cast<const RS_NOTIFICATION_CONFIG_UPDATED*>(data);
-        EventLogger::Instance().LogConfigChanged(
+        g_module.Logger().LogConfigChanged(
             n->FileCountThreshold,
             n->TimeWindowSeconds,
             n->MonitoringEnabled ? true : false);
@@ -110,11 +106,11 @@ static void ListenerCallback(const BYTE* data, DWORD dataSize) {
 }
 
 // ============================================================================
-// Helper: (re)start the CommManager listener with our callback
+// Helper: (re)start the listener
 // ============================================================================
 
 static void StartListening() {
-    CommManager::Instance().StartListener(ListenerCallback);
+    g_module.StartListener(ListenerCallback);
 }
 
 // ============================================================================
@@ -123,7 +119,7 @@ static void StartListening() {
 
 static void ShowStatusDialog(HWND hwnd) {
     RS_REPLY_CONFIG cfg = {};
-    if (FAILED(CommManager::Instance().QueryConfig(cfg))) {
+    if (FAILED(g_module.Comm().QueryConfig(cfg))) {
         MessageBoxW(hwnd,
             L"Could not retrieve driver status.\n"
             L"The driver may have disconnected.",
@@ -148,20 +144,18 @@ static void ShowStatusDialog(HWND hwnd) {
 static void OpenLogFile() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-
     wchar_t* lastSlash = wcsrchr(exePath, L'\\');
     if (lastSlash) {
         StringCchCopyW(lastSlash + 1,
                        MAX_PATH - static_cast<DWORD>(lastSlash - exePath + 1),
                        L"RansomShield.log");
     }
-
     ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOW);
 }
 
 static void TogglePauseMonitoring(HWND hwnd) {
     RS_REPLY_CONFIG cfg = {};
-    if (FAILED(CommManager::Instance().QueryConfig(cfg))) {
+    if (FAILED(g_module.Comm().QueryConfig(cfg))) {
         MessageBoxW(hwnd, L"Could not query driver state.",
                     L"RansomShield", MB_OK | MB_ICONWARNING);
         return;
@@ -171,16 +165,16 @@ static void TogglePauseMonitoring(HWND hwnd) {
     HRESULT hr;
 
     if (currentlyMonitoring) {
-        hr = CommManager::Instance().PauseMonitoring();
+        hr = g_module.Comm().PauseMonitoring();
         if (SUCCEEDED(hr)) {
             NotificationManager::Instance().SetStatus(true, true);
-            ConfigManager::Instance().SetMonitoringEnabled(false);
+            g_module.Config().SetMonitoringEnabled(false);
         }
     } else {
-        hr = CommManager::Instance().ResumeMonitoring();
+        hr = g_module.Comm().ResumeMonitoring();
         if (SUCCEEDED(hr)) {
             NotificationManager::Instance().SetStatus(true, false);
-            ConfigManager::Instance().SetMonitoringEnabled(true);
+            g_module.Config().SetMonitoringEnabled(true);
         }
     }
 }
@@ -192,12 +186,10 @@ static void TogglePauseMonitoring(HWND hwnd) {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 
-    // ── Tray icon notification ─────────────────────────────────────────────
     case NotificationManager::WM_TRAYNOTIFY:
         NotificationManager::Instance().HandleTrayMessage(lp);
         return 0;
 
-    // ── Blocked-PID alert from listener thread ─────────────────────────────
     case NotificationManager::WM_RSBLOCKED: {
         RsAlertData alert;
         while (NotificationManager::Instance().DrainAlert(alert)) {
@@ -206,7 +198,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    // ── Context-menu commands ──────────────────────────────────────────────
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case NotificationManager::IDM_STATUS:
@@ -227,34 +218,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
-    // ── Health-check / reconnect timer ────────────────────────────────────
     case WM_TIMER:
         if (wp == ID_TIMER_HEALTH) {
-            bool connected = CommManager::Instance().IsConnected();
+            bool connected = g_module.Comm().IsConnected();
 
             if (!connected) {
-                // Attempt reconnection every tick (5 s) until we succeed.
-                HRESULT hr = CommManager::Instance().Connect();
+                HRESULT hr = g_module.Connect();
                 if (SUCCEEDED(hr)) {
-                    ConfigManager::Instance().PushToDriver();
+                    g_module.PushToDriver();
                     StartListening();
                     NotificationManager::Instance().SetStatus(true, false);
-                    EventLogger::Instance().LogInfo(
-                        L"RansomShield tray agent reconnected to driver.");
+                    g_module.Logger().LogInfo(L"RansomShield tray agent reconnected to driver.");
                     s_healthTick = 0;
                 }
-                // If still failing, SetStatus keeps the "offline" tooltip.
             } else {
-                // Periodic deep health check (every 60 s)
-                s_healthTick++;
-                if (s_healthTick >= HEALTH_TICKS_PER_QUERY) {
+                if (++s_healthTick >= HEALTH_TICKS_PER_QUERY) {
                     s_healthTick = 0;
                     RS_REPLY_CONFIG cfg = {};
-                    if (FAILED(CommManager::Instance().QueryConfig(cfg))) {
-                        // Driver has gone away
-                        CommManager::Instance().Disconnect();
+                    if (FAILED(g_module.Comm().QueryConfig(cfg))) {
+                        g_module.Comm().Disconnect();
                         NotificationManager::Instance().SetStatus(false, false);
-                        EventLogger::Instance().LogWarning(
+                        g_module.Logger().LogWarning(
                             L"RansomShield driver connection lost. Retrying...");
                     }
                 }
@@ -262,13 +246,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
-    // ── Shutdown ──────────────────────────────────────────────────────────
     case WM_DESTROY:
         KillTimer(hwnd, ID_TIMER_HEALTH);
         NotificationManager::Instance().Shutdown();
-        CommManager::Instance().StopListener();
-        CommManager::Instance().Disconnect();
-        EventLogger::Instance().LogInfo(L"RansomShield tray agent stopped.");
+        g_module.Disconnect();
+        g_module.Logger().LogInfo(L"RansomShield tray agent stopped.");
         PostQuitMessage(0);
         return 0;
     }
@@ -283,14 +265,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                     LPWSTR /*lpCmdLine*/, int /*nCmdShow*/)
 {
-    // ── Single-instance guard ──────────────────────────────────────────────
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(hMutex);
         return 0;
     }
 
-    // ── Privilege check ────────────────────────────────────────────────────
     if (!IsElevated()) {
         MessageBoxW(nullptr,
             L"RansomShield requires Administrator privileges.\n\n"
@@ -300,7 +280,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         return 1;
     }
 
-    // ── Register hidden message window class ──────────────────────────────
     WNDCLASSEXW wc   = {};
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = WndProc;
@@ -308,35 +287,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     wc.lpszClassName = WINDOW_CLASS;
     RegisterClassExW(&wc);
 
-    // Create an invisible 1×1 window. Its sole purpose is to own the
-    // tray icon and serve as the target for PostMessage / SendMessage.
     HWND hwnd = CreateWindowExW(
         0, WINDOW_CLASS, L"RansomShield",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1, 1,
         nullptr, nullptr, hInstance, nullptr);
 
-    // ── Initialise subsystems ──────────────────────────────────────────────
-    EventLogger::Instance().Initialize();
-    ConfigManager::Instance().Initialize();
+    g_module.Initialize();
     NotificationManager::Instance().Initialize(hInstance, hwnd);
 
-    // ── Connect to driver (best-effort; timer retries on failure) ─────────
-    HRESULT hr = CommManager::Instance().Connect();
+    HRESULT hr = g_module.Connect();
     if (SUCCEEDED(hr)) {
-        ConfigManager::Instance().PushToDriver();
+        g_module.PushToDriver();
         StartListening();
         NotificationManager::Instance().SetStatus(true, false);
-        EventLogger::Instance().LogInfo(L"RansomShield tray agent started.");
+        g_module.Logger().LogInfo(L"RansomShield tray agent started.");
     } else {
         NotificationManager::Instance().SetStatus(false, false);
-        // The health-check timer will retry every 5 s.
     }
 
-    // ── Health-check / reconnect timer ────────────────────────────────────
     SetTimer(hwnd, ID_TIMER_HEALTH, HEALTH_INTERVAL_MS, nullptr);
 
-    // ── Message loop ──────────────────────────────────────────────────────
     MSG msg = {};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);

@@ -69,7 +69,7 @@
         WIN32_LEAN_AND_MEAN: exclude rarely-used Windows headers for faster compilation.
       -->
       <PreprocessorDefinitions>_DEBUG;_WINDOWS;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)sdk;$(SolutionDir)usermode\common;$(SolutionDir)usermode\tray;$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
@@ -80,7 +80,7 @@
         advapi32.lib   — Registry, EventLog, token APIs
         shell32.lib    — Shell_NotifyIcon, SHGetStockIconInfo, ShellExecute
       -->
-      <AdditionalDependencies>fltLib.lib;advapi32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fltLib.lib;advapi32.lib;shell32.lib;ole32.lib;taskschd.lib;oleaut32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(UserModeLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- Windows subsystem: no console window; entry point is wWinMain -->
       <SubSystem>Windows</SubSystem>
@@ -96,12 +96,12 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NDEBUG;_WINDOWS;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)sdk;$(SolutionDir)usermode\common;$(SolutionDir)usermode\tray;$(UserModeIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>fltLib.lib;advapi32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fltLib.lib;advapi32.lib;shell32.lib;ole32.lib;taskschd.lib;oleaut32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(UserModeLibs);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>false</GenerateDebugInformation>
@@ -111,21 +111,22 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <!-- Tray-specific entry point and notification manager -->
-    <ClCompile Include="TrayMain.cpp" />
-    <ClCompile Include="NotificationManager.cpp" />
-    <!-- Shared modules reused from the CLI client (no Main.cpp) -->
-    <ClCompile Include="CommManager.cpp" />
-    <ClCompile Include="ConfigManager.cpp" />
-    <ClCompile Include="EventLogger.cpp" />
+    <ClCompile Include="usermode\tray\TrayMain.cpp" />
+    <ClCompile Include="usermode\tray\NotificationManager.cpp" />
+    <ClCompile Include="usermode\common\RansomShieldModule.cpp" />
+    <ClCompile Include="usermode\common\CommManager.cpp" />
+    <ClCompile Include="usermode\common\ConfigManager.cpp" />
+    <ClCompile Include="usermode\common\EventLogger.cpp" />
   </ItemGroup>
 
   <ItemGroup>
-    <ClInclude Include="NotificationManager.h" />
-    <ClInclude Include="CommManager.h" />
-    <ClInclude Include="ConfigManager.h" />
-    <ClInclude Include="EventLogger.h" />
-    <ClInclude Include="SharedDefs.h" />
+    <ClInclude Include="sdk\IProtectionModule.h" />
+    <ClInclude Include="usermode\tray\NotificationManager.h" />
+    <ClInclude Include="usermode\common\RansomShieldModule.h" />
+    <ClInclude Include="usermode\common\CommManager.h" />
+    <ClInclude Include="usermode\common\ConfigManager.h" />
+    <ClInclude Include="usermode\common\EventLogger.h" />
+    <ClInclude Include="usermode\common\SharedDefs.h" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

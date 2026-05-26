@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv RansomShield.c RansomShield.h kernel/)",
+      "Bash(mv Context.c kernel/RsContext.c)",
+      "Bash(mv CommPort.c kernel/RsCommPort.c)"
+    ]
+  }
+}

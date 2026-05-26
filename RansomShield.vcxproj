@@ -92,7 +92,7 @@
       <TreatWarningAsError>false</TreatWarningAsError>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>_DEBUG;_AMD64_;NTDDI_VERSION=0x0A000009;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)kernel;$(SolutionDir)usermode\common;$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <CompileAs>CompileAsC</CompileAs>
       <!-- Kernel mode: no C++ exceptions, no CRT buffer security (use BufferOverflowK.lib instead) -->
       <ExceptionHandling>false</ExceptionHandling>
@@ -136,7 +136,7 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <PreprocessorDefinitions>NDEBUG;_AMD64_;NTDDI_VERSION=0x0A000009;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)kernel;$(SolutionDir)usermode\common;$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <CompileAs>CompileAsC</CompileAs>
       <ExceptionHandling>false</ExceptionHandling>
       <BufferSecurityCheck>false</BufferSecurityCheck>
@@ -158,13 +158,14 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="RansomShield.c" />
-    <ClCompile Include="Context.c" />
-    <ClCompile Include="CommPort.c" />
+    <ClCompile Include="kernel\RansomShield.c" />
+    <ClCompile Include="kernel\RsContext.c" />
+    <ClCompile Include="kernel\RsCommPort.c" />
   </ItemGroup>
 
   <ItemGroup>
-    <ClInclude Include="RansomShield.h" />
+    <ClInclude Include="kernel\RansomShield.h" />
+    <ClInclude Include="usermode\common\SharedDefs.h" />
   </ItemGroup>
 
   <ItemGroup>
