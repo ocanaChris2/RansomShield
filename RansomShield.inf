@@ -33,10 +33,11 @@
 [Version]
 Signature   = "$Windows NT$"
 Class       = "ActivityMonitor"                          ; Minifilters use ActivityMonitor class
-ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8c12202e5a6}    ; GUID for ActivityMonitor class
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}    ; Canonical GUID for the ActivityMonitor class (verified by InfVerif)
 Provider    = %ProviderString%
 DriverVer   = 01/01/2026,1.0.0.0
 CatalogFile = RansomShield.cat
+PnpLockdown = 1                                          ; Protect installed driver files from tampering (InfVerif 1324)
 
 ;
 ; ============================================================================

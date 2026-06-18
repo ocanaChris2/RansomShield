@@ -1,0 +1,77 @@
+/*++
+Module Name:
+    RansomShield.rc
+
+Abstract:
+    Win32 VERSION_INFO resource for the RansomShield minifilter driver.
+
+    A driver image SHOULD carry a VS_VERSION_INFO resource:
+      - Windows Explorer / signtool / "Get-FileVersionInfo" surface it.
+      - InfVerif and the Hardware Lab Kit (HLK) "version" checks expect it.
+      - It lets a deployed RansomShield.sys be correlated to a source build.
+
+    The numeric constants (VS_VERSION_INFO, VFT_DRV, ...) are normally pulled in
+    via <windows.h> / <verrsrc.h>, which live in the user-mode SDK "um" include
+    directory. The kernel driver project (RansomShield.vcxproj) only references
+    the WDK "km"/"shared" include paths, so we define the handful of constants we
+    need locally with #ifndef guards. This keeps the resource self-contained and
+    compilable by rc.exe regardless of which include paths are configured, and is
+    a no-op when the real headers are present.
+
+    FILEVERSION / PRODUCTVERSION are kept in lock-step with DriverVer in
+    RansomShield.inf (1.0.0.0). Update all three together when releasing.
+--*/
+
+#ifndef VS_VERSION_INFO
+#define VS_VERSION_INFO     1
+#endif
+#ifndef VOS_NT_WINDOWS32
+#define VOS_NT_WINDOWS32    0x00040004L
+#endif
+#ifndef VFT_DRV
+#define VFT_DRV             0x00000003L
+#endif
+#ifndef VFT2_DRV_SYSTEM
+#define VFT2_DRV_SYSTEM     0x00000007L
+#endif
+#ifndef VS_FF_DEBUG
+#define VS_FF_DEBUG         0x00000001L
+#endif
+#ifndef VS_FF_PRERELEASE
+#define VS_FF_PRERELEASE    0x00000002L
+#endif
+
+#ifdef _DEBUG
+#define RS_FILEFLAGS (VS_FF_DEBUG | VS_FF_PRERELEASE)
+#else
+#define RS_FILEFLAGS 0x0L
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,0,0,0
+ PRODUCTVERSION  1,0,0,0
+ FILEFLAGSMASK   0x3fL
+ FILEFLAGS       RS_FILEFLAGS
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_DRV
+ FILESUBTYPE     VFT2_DRV_SYSTEM
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"            /* U.S. English (0x0409), Unicode (0x04B0 = 1200) */
+        BEGIN
+            VALUE "CompanyName",      "RansomShield Development"
+            VALUE "FileDescription",  "RansomShield File System Minifilter Driver"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "RansomShield.sys"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 RansomShield Development. All rights reserved."
+            VALUE "OriginalFilename", "RansomShield.sys"
+            VALUE "ProductName",      "RansomShield Ransomware Protection"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

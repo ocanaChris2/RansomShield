@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RansomShield.ruleset
+  ====================
+  Code Analysis (PREfast / MSVC native analyzer) rule set for the RansomShield
+  kernel driver. It layers on top of the WDK "Driver Recommended Rules" that ship
+  inside the pinned WDK NuGet package, then promotes the memory-safety / kernel
+  defects that matter most for a minifilter from "Warning" to "Error" so they fail
+  the build and the certification gate.
+
+  HOW IT IS CONSUMED
+    RansomShield.vcxproj sets:
+        <CodeAnalysisRuleSet>$(SolutionDir)certification\rulesets\RansomShield.ruleset</CodeAnalysisRuleSet>
+    and the gate runs:
+        msbuild RansomShield.vcxproj /p:RunCodeAnalysis=true /p:EnableMicrosoftCodeAnalysis=true
+
+  NOTE ON COVERAGE
+    The C6xxx rules are part of the core MSVC native analyzer and run anywhere the
+    v145 toolset is installed (including the NuGet-only build used in CI).
+    The C28xxx rules are *driver-specific* and only emit when the WDK code-analysis
+    analyzers are available — i.e. on a machine with the WDK + the "Windows Driver
+    Kit" VS extension, which is exactly where RansomShield.Driver.vcxproj (and SDV)
+    run. They are listed here so the authoritative driver build enforces them too;
+    they are harmless no-ops when that analyzer is not loaded.
+
+  The <Include> below pulls in Microsoft's full recommended driver baseline; the
+  explicit <Rules> entries override individual rule actions on top of it.
+-->
+<RuleSet Name="RansomShield Driver Certification Rules"
+         Description="WDK recommended driver rules + RansomShield memory-safety escalations."
+         ToolsVersion="16.0">
+
+  <!-- Microsoft's recommended baseline for kernel drivers (pinned WDK NuGet package). -->
+  <Include Path="..\..\packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\c\CodeAnalysis\DriverRecommendedRules.ruleset"
+           Action="Default" />
+
+  <!-- Core native analyzer (PREfast). Available with the v145 toolset everywhere. -->
+  <Rules AnalyzerId="Microsoft.Analyzers.NativeCodeAnalysis" RuleNamespace="Microsoft.Rules.Native">
+    <Rule Id="C6001" Action="Error" />  <!-- Using uninitialized memory -->
+    <Rule Id="C6011" Action="Error" />  <!-- Dereferencing NULL pointer -->
+    <Rule Id="C6014" Action="Error" />  <!-- Memory leak -->
+    <Rule Id="C6029" Action="Error" />  <!-- Possible buffer overrun: unchecked returned length -->
+    <Rule Id="C6031" Action="Warning" /><!-- Return value ignored -->
+    <Rule Id="C6053" Action="Error" />  <!-- String may not be zero-terminated -->
+    <Rule Id="C6063" Action="Error" />  <!-- Missing argument for format string -->
+    <Rule Id="C6066" Action="Error" />  <!-- Non-pointer passed where pointer expected -->
+    <Rule Id="C6101" Action="Error" />  <!-- Returning uninitialized _Out_ memory -->
+    <Rule Id="C6200" Action="Error" />  <!-- Index exceeds buffer size -->
+    <Rule Id="C6201" Action="Error" />  <!-- Index out of valid range for stack buffer -->
+    <Rule Id="C6262" Action="Warning" /><!-- Excessive stack usage (ring-buffer temp copy is bounded) -->
+    <Rule Id="C6263" Action="Error" />  <!-- alloca in a loop -->
+    <Rule Id="C6385" Action="Error" />  <!-- Reading invalid data (buffer underrun) -->
+    <Rule Id="C6386" Action="Error" />  <!-- Buffer overrun -->
+    <Rule Id="C6387" Action="Error" />  <!-- Argument may be NULL where not allowed -->
+  </Rules>
+
+  <!-- Driver-specific analyzer (WDK extension / SDV machine only). -->
+  <Rules AnalyzerId="Microsoft.Analyzers.NativeCodeAnalysis" RuleNamespace="Microsoft.Rules.Native.Drivers">
+    <Rule Id="C28104" Action="Error" /> <!-- Resource not held on this path -->
+    <Rule Id="C28107" Action="Error" /> <!-- Variable should be held -->
+    <Rule Id="C28121" Action="Error" /> <!-- Function called at incorrect IRQL -->
+    <Rule Id="C28150" Action="Error" /> <!-- Structure member not fully initialized -->
+    <Rule Id="C28182" Action="Error" /> <!-- Dereferencing NULL pointer (alias) -->
+    <Rule Id="C28196" Action="Error" /> <!-- Assertion not satisfied (precondition) -->
+    <Rule Id="C28197" Action="Error" /> <!-- Possibly leaking memory -->
+    <Rule Id="C28931" Action="Warning" /><!-- Unused assignment -->
+  </Rules>
+
+</RuleSet>

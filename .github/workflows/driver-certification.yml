@@ -1,0 +1,105 @@
+name: Driver Certification
+
+# Runs the host-runnable RansomShield certification gates and publishes the
+# evidence bundle + SARIF on every push/PR.
+#
+# RUNNER REQUIREMENT
+#   This driver pins PlatformToolset=v145 (Visual Studio 2025 / "18") and builds
+#   the kernel sources, which GitHub-hosted `windows-latest` (VS 2022 / v143, no
+#   WDK) cannot do. The job therefore targets a SELF-HOSTED Windows runner that
+#   has: VS 2025 with the v145 toolset, the Windows SDK (InfVerif/Inf2Cat/signtool),
+#   the .NET SDK (BinSkim) and network access to nuget.org, and — to also run
+#   SDV/DVL — the WDK 10.0.26100 + the "Windows Driver Kit" VS extension.
+#
+#   Label such a runner with: [self-hosted, windows, wdk]
+#
+#   Runtime gates (Driver Verifier, RansomSim) require a dedicated test VM with
+#   test-signing on / HVCI off and are intentionally NOT part of hosted CI; run
+#   them per certification/docs/test-plan.md.
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**/*.md'
+      - 'certification/docs/**'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'certification/docs/**'
+  workflow_dispatch:
+    inputs:
+      run_sdv_dvl:
+        description: 'Also run Static Driver Verifier + DVL (slow; WDK runner only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  security-events: write   # required to publish SARIF to the Security tab
+
+jobs:
+  certify:
+    name: Static certification gates (Release x64)
+    runs-on: [self-hosted, windows, wdk]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore WDK/SDK NuGet packages
+        shell: pwsh
+        run: |
+          if (-not (Test-Path .\nuget.exe)) {
+            Invoke-WebRequest https://dist.nuget.org/win-x86-commandline/latest/nuget.exe -OutFile nuget.exe
+          }
+          .\nuget.exe restore RansomShield.sln -PackagesDirectory packages
+
+      - name: Run certification gates
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ('${{ github.event.inputs.run_sdv_dvl }}' -eq 'true') { $extra += '-IncludeSdvDvl' }
+          pwsh certification/scripts/Invoke-AllGates.ps1 -Configuration Release @extra
+
+      - name: Resolve evidence directory
+        id: ev
+        if: always()
+        shell: pwsh
+        run: |
+          $d = $null
+          if (Test-Path certification/evidence/LATEST.txt) { $d = (Get-Content certification/evidence/LATEST.txt -Raw).Trim() }
+          if (-not $d -or -not (Test-Path $d)) {
+            $d = (Get-ChildItem certification/evidence -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          }
+          "dir=$d" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish CodeQL SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.ev.outputs.dir }}/codeql.sarif
+          category: codeql-driver
+        continue-on-error: true
+
+      - name: Publish BinSkim SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.ev.outputs.dir }}/binskim.sarif
+          category: binskim
+        continue-on-error: true
+
+      - name: Upload evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: certification-evidence
+          path: ${{ steps.ev.outputs.dir }}
+          if-no-files-found: warn
+
+      - name: Summarize
+        if: always()
+        shell: pwsh
+        run: |
+          $report = Join-Path '${{ steps.ev.outputs.dir }}' 'gate-report.md'
+          if (Test-Path $report) { Get-Content $report -Raw | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }

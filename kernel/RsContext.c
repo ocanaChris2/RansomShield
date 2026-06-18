@@ -141,7 +141,7 @@ static
 PRS_PROCESS_CONTEXT
 RsCreateProcessContext(
     _In_ ULONG ProcessId,
-    _In_ PUNICODE_STRING ProcessImageName
+    _In_opt_ PUNICODE_STRING ProcessImageName
     );
 
 static
@@ -154,7 +154,7 @@ static
 VOID
 RsCopyImageNameToContext(
     _Inout_ PRS_PROCESS_CONTEXT Context,
-    _In_ PUNICODE_STRING SourceName
+    _In_opt_ PUNICODE_STRING SourceName
     );
 
 // ============================================================================
@@ -393,7 +393,7 @@ static
 PRS_PROCESS_CONTEXT
 RsCreateProcessContext(
     _In_ ULONG ProcessId,
-    _In_ PUNICODE_STRING ProcessImageName
+    _In_opt_ PUNICODE_STRING ProcessImageName
     )
 {
     PRS_PROCESS_CONTEXT context;
@@ -473,7 +473,7 @@ static
 VOID
 RsCopyImageNameToContext(
     _Inout_ PRS_PROCESS_CONTEXT Context,
-    _In_ PUNICODE_STRING SourceName
+    _In_opt_ PUNICODE_STRING SourceName
     )
 {
     ULONG copyChars;
@@ -556,7 +556,7 @@ Return Value:
 NTSTATUS
 RsRecordOperation(
     _In_ ULONG ProcessId,
-    _In_ PUNICODE_STRING ProcessImageName,
+    _In_opt_ PUNICODE_STRING ProcessImageName,
     _Out_ PBOOLEAN ShouldBlock
     )
 {

@@ -1,6 +1,10 @@
 # RansomShield
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/J1R621M7VN)
+
 A Windows kernel-mode minifilter driver that detects and blocks ransomware in real time, paired with a user-mode control client and a background tray agent that shows live Windows notifications when a process is blocked.
+
+> **Certification:** an enterprise-grade security & quality certification package for the driver lives in [`certification/`](certification/) — formal report, threat model, compliance matrix, and reproducible static/runtime quality gates (Code Analysis, CodeQL, BinSkim, SDV/DVL, Driver Verifier, signed-catalog packaging) wired into CI. Start with the [certification report](certification/RansomShield-Certification-Report.md).
 
 ## How it works
 

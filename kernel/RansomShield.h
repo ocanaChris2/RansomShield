@@ -335,7 +335,7 @@ RsDestroyContextTracking(
 NTSTATUS
 RsRecordOperation(
     _In_ ULONG ProcessId,
-    _In_ PUNICODE_STRING ProcessImageName,
+    _In_opt_ PUNICODE_STRING ProcessImageName,
     _Out_ PBOOLEAN ShouldBlock
     );
 
