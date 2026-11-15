@@ -116,6 +116,24 @@ jobs:
           nuget restore RansomShield.sln -PackagesDirectory packages -NonInteractive
           if ($LASTEXITCODE -ne 0) { throw "nuget restore failed ($LASTEXITCODE)" }
 
+      - name: Trust a test signing certificate (this runner only)
+        run: |
+          # The packaging gate signs the catalog with CN=RansomShield Test Signing
+          # and requires the signature to verify, which needs that self-signed
+          # certificate to be trusted. Deploy-RansomShield.ps1 trusts it on test
+          # machines; this throwaway runner gets the same setup before the gates.
+          $created = New-SelfSignedCertificate -Subject 'CN=RansomShield Test Signing' `
+            -CertStoreLocation 'Cert:\CurrentUser\My' -Type CodeSigningCert `
+            -HashAlgorithm SHA256 -KeyUsage DigitalSignature -KeyLength 2048
+          $cert = Get-Item "Cert:\CurrentUser\My\$($created.Thumbprint)"
+          foreach ($storeName in 'Root', 'TrustedPublisher') {
+            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new($storeName, 'LocalMachine')
+            $store.Open('ReadWrite')
+            $store.Add($cert)
+            $store.Close()
+          }
+          Write-Host "Trusted test certificate $($cert.Thumbprint) in LocalMachine\Root and TrustedPublisher"
+
       - name: Certification gates
         env:
           SKIP_CODEQL: ${{ github.event_name == 'pull_request' }}
@@ -145,11 +163,15 @@ jobs:
           Get-ChildItem $out -Recurse -File -Include *.sys, *.cat | Remove-Item -Force
 
           "dir=$out" >> $env:GITHUB_OUTPUT
+          foreach ($name in 'codeql', 'binskim') {
+            $has = if (Test-Path (Join-Path $out "$name.sarif")) { 'true' } else { 'false' }
+            "${name}_sarif=$has" >> $env:GITHUB_OUTPUT
+          }
           $report = Join-Path $out 'gate-report.md'
           if (Test-Path $report) { Get-Content $report -Raw >> $env:GITHUB_STEP_SUMMARY }
 
       - name: Publish CodeQL results to code scanning
-        if: always() && steps.evidence.outputs.dir != '' && github.event_name != 'pull_request'
+        if: always() && steps.evidence.outputs.codeql_sarif == 'true' && github.event_name != 'pull_request'
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
@@ -157,7 +179,7 @@ jobs:
           category: codeql-driver
 
       - name: Publish BinSkim results to code scanning
-        if: always() && steps.evidence.outputs.dir != ''
+        if: always() && steps.evidence.outputs.binskim_sarif == 'true'
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:

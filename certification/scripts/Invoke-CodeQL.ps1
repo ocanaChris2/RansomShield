@@ -3,18 +3,17 @@
     CodeQL gate for the RansomShield driver (Windows driver query suite).
 
 .DESCRIPTION
-    Builds a CodeQL database by compiling RansomShield.vcxproj under CodeQL
-    tracing, then analyzes it with the Windows driver recommended query suite
-    (falling back to cpp-security-and-quality if the driver suite is absent) and
-    emits SARIF. CodeQL is the modern Microsoft Hardware Dev Center submission
+    Builds a CodeQL database by compiling the driver project (through
+    RansomShield.sln) under CodeQL tracing, then analyzes it with the Windows
+    driver recommended query suite (falling back to cpp-security-and-quality if
+    the driver suite is absent) and emits SARIF. CodeQL is the modern Microsoft
+    Hardware Dev Center submission
     requirement.
 
     Bootstrapping (first run; needs network):
       * CodeQL CLI bundle  -> downloaded to certification\.tools\codeql if not on PATH.
-      * Windows driver pack -> Microsoft/Windows-Driver-Developer-Supplemental-Tools
-                               (windows_driver_recommended.qls) cloned to
-                               certification\.tools\windows-drivers if -DriverSuiteRepo
-                               is not supplied and git is available.
+      * Windows driver pack -> microsoft/windows-drivers (see -Suite), downloaded by
+                               CodeQL itself on first use (--download).
 
     Evidence:
       codeql.sarif             analysis result
@@ -27,14 +26,23 @@
 .PARAMETER EvidenceDir
     Target evidence directory. A fresh timestamped one is created if omitted.
 
-.PARAMETER DriverSuiteRepo
-    Optional path to a local checkout of the Windows driver CodeQL suite.
+.PARAMETER Suite
+    Query suite to run. Default: the recommended suite of Microsoft's published
+    microsoft/windows-drivers CodeQL pack, pinned to the version the Windows
+    driver docs list for current development ("Static Tools and CodeQL",
+    learn.microsoft.com).
+
+.PARAMETER Packs
+    Query packs downloaded before the analysis: the driver pack and the
+    microsoft/cpp-queries pack its suites import, at the versions the same
+    docs pair for current development.
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Debug','Release')][string]$Configuration = 'Release',
     [string]$EvidenceDir,
-    [string]$DriverSuiteRepo
+    [string]$Suite = 'microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls',
+    [string[]]$Packs = @('microsoft/windows-drivers@1.10.0', 'microsoft/cpp-queries@0.0.5')
 )
 
 Set-StrictMode -Version Latest
@@ -76,28 +84,35 @@ if (-not $codeql) {
 }
 Write-RsInfo "CodeQL: $codeql"
 
-# ── Resolve the query suite ──────────────────────────────────────────────────
-$suite = 'cpp-security-and-quality.qls'   # safe default shipped with the bundle
-if (-not $DriverSuiteRepo) {
-    $DriverSuiteRepo = Join-Path $RsCertRoot '.tools\windows-drivers'
-    if (-not (Test-Path $DriverSuiteRepo) -and (Get-Command git -ErrorAction SilentlyContinue)) {
-        Write-RsInfo 'Cloning the Windows driver CodeQL suite ...'
-        try {
-            & git clone --depth 1 `
-                https://github.com/microsoft/Windows-Driver-Developer-Supplemental-Tools.git `
-                $DriverSuiteRepo 2>&1 | Out-Null
-        } catch { Write-RsWarn "Driver suite clone failed; using $suite." }
-    }
+# ── Query suite ──────────────────────────────────────────────────────────────
+# A pack reference (pack@version:path), not a cloned repository: a .qls file
+# taken out of its pack cannot resolve the suites it imports ("is not in a
+# pack, so we don't know what to resolve it against").
+$suite = $Suite
+Write-RsInfo "Query suite: $suite"
+
+# The driver suites import queries from a second pack, microsoft/cpp-queries,
+# which `database analyze --download` does not fetch ("The QL pack ... cannot
+# be found"). Download both up front, before the build, so a missing pack
+# fails fast.
+$packLog = Join-Path $EvidenceDir 'codeql.packs.log'
+Write-RsInfo "Downloading query packs: $($Packs -join ', ')"
+& $codeql pack download @Packs 2>&1 | Out-File -FilePath $packLog -Encoding utf8
+if ($LASTEXITCODE -ne 0) {
+    Write-RsFail 'CodeQL query pack download failed (see codeql.packs.log).'
+    Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'CodeQL' -Status 'Fail' `
+        -Details @{ reason = 'query pack download failed'; packs = $Packs } `
+        -Artifacts @('codeql.packs.log') | Out-Null
+    exit 1
 }
-$driverQls = Get-ChildItem $DriverSuiteRepo -Filter 'windows_driver_recommended.qls' `
-              -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($driverQls) { $suite = $driverQls.FullName; Write-RsInfo "Driver suite: $suite" }
-else { Write-RsWarn "Windows driver suite not found; using built-in $suite." }
 
 # ── Create the database (traced build) ───────────────────────────────────────
 $dbDir = Join-Path $EvidenceDir 'codeql-db'
-$buildCmd = '"{0}" "{1}" /p:Configuration={2} /p:Platform=x64 /p:SolutionDir="{3}\" /t:Rebuild /v:minimal /nologo' `
-            -f $msbuild, (Join-Path $RsRepoRoot 'RansomShield.vcxproj'), $Configuration, $RsRepoRoot
+# Build the driver project through the solution, which sets SolutionDir itself.
+# CodeQL splits --command into arguments on its own and rejects a quote inside
+# an argument, such as /p:SolutionDir="C:\path\".
+$buildCmd = '"{0}" "{1}" /t:RansomShield:Rebuild /p:Configuration={2} /p:Platform=x64 /v:minimal /nologo' `
+            -f $msbuild, (Join-Path $RsRepoRoot 'RansomShield.sln'), $Configuration
 
 Write-RsInfo 'Creating CodeQL database (this compiles the driver) ...'
 & $codeql database create "$dbDir" --language=cpp --overwrite --command=$buildCmd 2>&1 |
@@ -116,28 +131,30 @@ $sarif = Join-Path $EvidenceDir 'codeql.sarif'
     Tee-Object -FilePath (Join-Path $EvidenceDir 'codeql.analyze.log') | Out-Null
 
 if (-not (Test-Path $sarif)) {
-    Write-RsFail 'CodeQL analysis produced no SARIF.'
+    Write-RsFail 'CodeQL analysis produced no SARIF (see codeql.analyze.log).'
     Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'CodeQL' -Status 'Fail' `
-        -Details @{ reason = 'no SARIF produced' } | Out-Null
+        -Details @{ reason = 'no SARIF produced' } -Artifacts @('codeql.analyze.log') | Out-Null
     exit 1
 }
 
-$doc = Get-Content $sarif -Raw | ConvertFrom-Json
-$results = @()
-foreach ($run in $doc.runs) { if ($run.results) { $results += $run.results } }
-$errors = @($results | Where-Object { $_.level -eq 'error' })
-($results | Group-Object ruleId, level | ForEach-Object { "{0,-6} {1}" -f $_.Count, $_.Name }) |
+# Error-level results (effective level, see Get-RsSarifResults).
+$results = Get-RsSarifResults -Path $sarif
+$errors = @($results | Where-Object { $_.Level -eq 'error' })
+($results | Group-Object RuleId, Level | ForEach-Object { "{0,-6} {1}" -f $_.Count, $_.Name }) |
     Set-Content -Path (Join-Path $EvidenceDir 'codeql.summary.txt') -Encoding UTF8
 
 $pass = ($errors.Count -eq 0)
 Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'CodeQL' `
     -Status ($(if ($pass) { 'Pass' } else { 'Fail' })) `
     -Details @{
-        suite        = (Split-Path $suite -Leaf)
+        suite        = $suite
         totalResults = $results.Count
         errorResults = $errors.Count
     } `
-    -Artifacts @('codeql.sarif','codeql.summary.txt') | Out-Null
+    -Artifacts @('codeql.sarif','codeql.summary.txt','codeql.analyze.log') | Out-Null
 
-if (-not $pass) { exit 1 }
+if (-not $pass) {
+    $errors | Select-Object -First 25 | ForEach-Object { Write-RsInfo ("{0}: {1}" -f $_.RuleId, $_.Message) }
+    exit 1
+}
 exit 0

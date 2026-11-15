@@ -110,11 +110,20 @@
       <PreprocessorDefinitions>_DEBUG;_AMD64_;NTDDI_VERSION=0x0A000009;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(SolutionDir)kernel;$(SolutionDir)usermode\common;$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <CompileAs>CompileAsC</CompileAs>
-      <!-- Kernel mode: no C++ exceptions, no CRT buffer security (use BufferOverflowK.lib instead) -->
+      <!-- Kernel mode: no C++ exceptions -->
       <ExceptionHandling>false</ExceptionHandling>
-      <BufferSecurityCheck>false</BufferSecurityCheck>
-      <!-- /kernel enables kernel-mode code generation; /GS- since we link BufferOverflowK.lib manually -->
-      <AdditionalOptions>/kernel /GS- %(AdditionalOptions)</AdditionalOptions>
+      <!--
+        Stack cookies (/GS) and Control Flow Guard (/guard:cf), as the WDK's own
+        driver projects set them (WindowsDriver.Common.props and
+        WindowsDriver.Shared.Props). The kernel-mode support (__security_cookie,
+        __security_check_cookie, _load_config_used, the __guard_*_icall_fptr
+        pointers and GsDriverEntry) comes from BufferOverflowK.lib. BinSkim fails
+        the build without them (BA2011, BA2008).
+      -->
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
+      <!-- /kernel enables kernel-mode code generation -->
+      <AdditionalOptions>/kernel %(AdditionalOptions)</AdditionalOptions>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <!-- RTC (_RTC_*) requires the CRT which is not available in kernel mode -->
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -141,8 +150,9 @@
       <!-- Exclude all user-mode CRT default libs; kernel uses ntoskrnl instead -->
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <!-- /INTEGRITYCHECK: required by PsSetCreateProcessNotifyRoutineEx (process-exit
-           tracking). The image must then be signed to load (test signature is fine). -->
-      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
+           tracking). The image must then be signed to load (test signature is fine).
+           /guard:cf: the link half of Control Flow Guard (see ClCompile). -->
+      <AdditionalOptions>/INTEGRITYCHECK /guard:cf %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <!-- Kernel drivers cannot have a side-by-side manifest -->
     </Link>
@@ -158,8 +168,13 @@
       <AdditionalIncludeDirectories>$(SolutionDir)kernel;$(SolutionDir)usermode\common;$(WdkKmIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <CompileAs>CompileAsC</CompileAs>
       <ExceptionHandling>false</ExceptionHandling>
-      <BufferSecurityCheck>false</BufferSecurityCheck>
-      <AdditionalOptions>/kernel /GS- %(AdditionalOptions)</AdditionalOptions>
+      <!-- /GS and /guard:cf: see the Debug configuration. -->
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
+      <AdditionalOptions>/kernel %(AdditionalOptions)</AdditionalOptions>
+      <!-- Full debug information, so BinSkim can check the compiler options
+           through the PDB. The PDB is a build artifact; it is not shipped. -->
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -170,9 +185,12 @@
       <Driver>WDM</Driver>
       <EntryPointSymbol>GsDriverEntry</EntryPointSymbol>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
-      <!-- /INTEGRITYCHECK: see the Debug configuration. -->
-      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
-      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <!-- /INTEGRITYCHECK and /guard:cf: see the Debug configuration.
+           /PDBALTPATH:%_PDB% records only the PDB's file name in the driver,
+           not the build machine's path. -->
+      <AdditionalOptions>/INTEGRITYCHECK /guard:cf /PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
+      <!-- A PDB for BinSkim and crash analysis (see ClCompile); it is not shipped. -->
+      <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
     </Link>

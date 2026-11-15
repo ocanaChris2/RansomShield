@@ -34,7 +34,8 @@ certification/
     certificate-of-conformance.md        One-page signed attestation
   rulesets/RansomShield.ruleset          Driver CA rules + memory-safety escalations
   scripts/                               Gate scripts (see below)
-  tools/                                 RansomSim.ps1, Workload-FalsePositive.ps1
+  tools/                                 RansomSim.ps1, Workload-FalsePositive.ps1,
+                                         Workload-ProcessChurn.ps1
   evidence/                              Generated bundles (git-ignored)
 ```
 
@@ -51,6 +52,10 @@ Produces `certification\evidence\<timestamp>-Release\` with per-gate
 `*.result.json`, logs/SARIF, the signed package, `environment.json`, and an
 aggregated `gate-report.md` / `gate-report.json`.
 
+The packaging gate checks the catalog signature, so the test certificate
+(`CN=RansomShield Test Signing`) must be trusted on that machine:
+`Deploy-RansomShield.ps1` trusts it, and CI trusts a throwaway one on its runner.
+
 **On a WDK machine** (adds SDV + DVL):
 
 ```powershell
@@ -64,6 +69,7 @@ pwsh certification\scripts\Invoke-AllGates.ps1 -Configuration Release -IncludeSd
 pwsh certification\scripts\Invoke-DriverVerifier.ps1 -Action enable   # reboot
 pwsh certification\tools\RansomSim.ps1 -EvidenceDir <bundle>          # detection
 pwsh certification\tools\Workload-FalsePositive.ps1 -EvidenceDir <bundle>  # no FP
+pwsh certification\tools\Workload-ProcessChurn.ps1 -EvidenceDir <bundle>   # bounded tracking
 pwsh certification\scripts\Invoke-DriverVerifier.ps1 -Action query    # capture
 ```
 
@@ -79,6 +85,7 @@ pwsh certification\scripts\Invoke-DriverVerifier.ps1 -Action query    # capture
 | SDV + DVL | `scripts/Invoke-Sdv-Dvl.ps1` | WDK machine |
 | Driver Verifier | `scripts/Invoke-DriverVerifier.ps1` | Test VM |
 | Functional efficacy / false positive | `tools/RansomSim.ps1`, `tools/Workload-FalsePositive.ps1` | Test VM |
+| Process churn (bounded tracking) | `tools/Workload-ProcessChurn.ps1` | Test VM |
 | Orchestrator | `scripts/Invoke-AllGates.ps1` | aggregates the host-runnable set |
 
 CI runs the host-runnable gates on every pull request and push to `main`

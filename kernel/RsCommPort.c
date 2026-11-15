@@ -559,7 +559,7 @@ RsGetReplySize(
 Routine Description:
     Exception filter for the copies to and from the client's raw user-mode
     buffers. Handles only the faults a bad or vanishing user buffer can
-    raise: an invalid or unmapped address, a misaligned probe, a paging
+    raise: an invalid or unmapped address, a misaligned access, a paging
     error on a mapped view. Any other exception is a driver bug and is not
     swallowed (which is also what Code Analysis rule C6320 asks for).
 --*/
@@ -687,10 +687,14 @@ RsMessageNotifyCallback(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    //
+    // Filter Manager has already probed InputBuffer for read and OutputBuffer
+    // for write before calling this routine (see the WDK minispy sample), so
+    // they are not probed again here. They are still raw user-mode buffers
+    // that can become invalid at any time, so every access to them stays
+    // inside __try/__except.
+    //
     __try {
-        if (ExGetPreviousMode() != KernelMode) {
-            ProbeForRead(InputBuffer, InputBufferLength, sizeof(UCHAR));
-        }
         RtlCopyMemory(request, InputBuffer, InputBufferLength);
     } __except (RsUserBufferExceptionFilter(GetExceptionCode())) {
         status = GetExceptionCode();
@@ -957,10 +961,7 @@ RsMessageNotifyCallback(
     // ---- 3. Copy the reply out to the client ----
     //
     __try {
-        if (ExGetPreviousMode() != KernelMode) {
-            ProbeForWrite(OutputBuffer, replySize, sizeof(UCHAR));
-        }
-        RtlCopyMemory(OutputBuffer, reply, replySize);
+        RtlCopyMemory(OutputBuffer, reply, replySize);   // probed by Filter Manager (see step 1)
         *ReturnOutputBufferLength = replySize;
     } __except (RsUserBufferExceptionFilter(GetExceptionCode())) {
         status = GetExceptionCode();
