@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-      security-events: write   # publish CodeQL / BinSkim SARIF to code scanning
+      security-events: write   # publish CodeQL SARIF to code scanning
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
@@ -163,13 +163,14 @@ jobs:
           Get-ChildItem $out -Recurse -File -Include *.sys, *.cat | Remove-Item -Force
 
           "dir=$out" >> $env:GITHUB_OUTPUT
-          foreach ($name in 'codeql', 'binskim') {
-            $has = if (Test-Path (Join-Path $out "$name.sarif")) { 'true' } else { 'false' }
-            "${name}_sarif=$has" >> $env:GITHUB_OUTPUT
-          }
+          $hasCodeql = if (Test-Path (Join-Path $out 'codeql.sarif')) { 'true' } else { 'false' }
+          "codeql_sarif=$hasCodeql" >> $env:GITHUB_OUTPUT
           $report = Join-Path $out 'gate-report.md'
           if (Test-Path $report) { Get-Content $report -Raw >> $env:GITHUB_STEP_SUMMARY }
 
+      # Only CodeQL goes to code scanning. BinSkim's SARIF stays in the evidence
+      # artifact exactly as BinSkim wrote it: code scanning rejects it, because
+      # BinSkim writes each result message as a template (id + arguments, no text).
       - name: Publish CodeQL results to code scanning
         if: always() && steps.evidence.outputs.codeql_sarif == 'true' && github.event_name != 'pull_request'
         continue-on-error: true
@@ -177,14 +178,6 @@ jobs:
         with:
           sarif_file: ${{ steps.evidence.outputs.dir }}/codeql.sarif
           category: codeql-driver
-
-      - name: Publish BinSkim results to code scanning
-        if: always() && steps.evidence.outputs.binskim_sarif == 'true'
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          sarif_file: ${{ steps.evidence.outputs.dir }}/binskim.sarif
-          category: binskim
 
       - name: Upload certification evidence
         if: always() && steps.evidence.outputs.dir != ''
