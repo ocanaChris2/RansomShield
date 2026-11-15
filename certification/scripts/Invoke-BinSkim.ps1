@@ -110,13 +110,16 @@ if (-not $binskim) {
 Write-RsInfo "BinSkim: $binskim"
 
 # BinSkim 4.x takes --output for the SARIF log (this version has no
-# --pretty-print option). A stale log is removed first so BinSkim never has
-# to overwrite one, and its console output is kept for diagnosis.
+# --pretty-print option). --insert FlattenedMessages writes each result's
+# message as text: BinSkim otherwise emits message templates, which GitHub
+# code scanning rejects ("expected a result message"). A stale log is removed
+# first so BinSkim never has to overwrite one, and its console output is kept.
 $sarif      = Join-Path $EvidenceDir 'binskim.sarif'
 $analyzeLog = Join-Path $EvidenceDir 'binskim.analyze.log'
 Remove-Item -LiteralPath $sarif -ErrorAction SilentlyContinue
 try {
-    & $binskim analyze "$sys" --output "$sarif" 2>&1 | Out-File -FilePath $analyzeLog -Encoding utf8
+    & $binskim analyze "$sys" --output "$sarif" --insert FlattenedMessages 2>&1 |
+        Out-File -FilePath $analyzeLog -Encoding utf8
 } catch { "binskim raised: $($_.Exception.Message)" | Add-Content -Path $analyzeLog }
 $binskimExit = $LASTEXITCODE
 
@@ -133,12 +136,16 @@ $results  = Get-RsSarifResults -Path $sarif
 $errors   = @($results | Where-Object { $_.Level -eq 'error' })
 $blocking = @($errors  | Where-Object { $KnownExceptions -notcontains $_.RuleId })
 
+# An analysis BinSkim could not complete fails the gate too: without a PDB,
+# for example, it reports ERR997 and skips every rule that needs one.
+$toolProblems = Get-RsSarifToolProblems -Path $sarif   # already an array; @() would nest it
+
 # Human summary.
 $summary = $results | Group-Object RuleId, Level |
     ForEach-Object { "{0,-10} {1}" -f $_.Count, $_.Name }
 $summary | Set-Content -Path (Join-Path $EvidenceDir 'binskim.summary.txt') -Encoding UTF8
 
-$pass = ($blocking.Count -eq 0)
+$pass = ($blocking.Count -eq 0 -and $toolProblems.Count -eq 0)
 Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'BinSkim' `
     -Status ($(if ($pass) { 'Pass' } else { 'Fail' })) `
     -Details @{
@@ -148,12 +155,14 @@ Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'BinSkim' `
         errorResults    = $errors.Count
         knownExceptions = $KnownExceptions
         blockingErrors  = $blocking.Count
+        incomplete      = $toolProblems
         exitCode        = $binskimExit
         tool            = $binskim
     } `
     -Artifacts @('binskim.sarif','binskim.summary.txt','binskim.analyze.log') | Out-Null
 
 if (-not $pass) {
+    $toolProblems | ForEach-Object { Write-RsInfo "BinSkim did not complete the analysis: $_" }
     $blocking | ForEach-Object { Write-RsInfo ("{0}: {1}" -f $_.RuleId, $_.Message) }
     exit 1
 }

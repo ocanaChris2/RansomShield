@@ -12,10 +12,8 @@
 
     Bootstrapping (first run; needs network):
       * CodeQL CLI bundle  -> downloaded to certification\.tools\codeql if not on PATH.
-      * Windows driver pack -> Microsoft/Windows-Driver-Developer-Supplemental-Tools
-                               (windows_driver_recommended.qls) cloned to
-                               certification\.tools\windows-drivers if -DriverSuiteRepo
-                               is not supplied and git is available.
+      * Windows driver pack -> microsoft/windows-drivers (see -Suite), downloaded by
+                               CodeQL itself on first use (--download).
 
     Evidence:
       codeql.sarif             analysis result
@@ -28,14 +26,17 @@
 .PARAMETER EvidenceDir
     Target evidence directory. A fresh timestamped one is created if omitted.
 
-.PARAMETER DriverSuiteRepo
-    Optional path to a local checkout of the Windows driver CodeQL suite.
+.PARAMETER Suite
+    Query suite to run. Default: the recommended suite of Microsoft's published
+    microsoft/windows-drivers CodeQL pack, pinned to the version the Windows
+    driver docs list for current development ("Static Tools and CodeQL",
+    learn.microsoft.com); CodeQL downloads the pack on first use (--download).
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Debug','Release')][string]$Configuration = 'Release',
     [string]$EvidenceDir,
-    [string]$DriverSuiteRepo
+    [string]$Suite = 'microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls'
 )
 
 Set-StrictMode -Version Latest
@@ -77,23 +78,12 @@ if (-not $codeql) {
 }
 Write-RsInfo "CodeQL: $codeql"
 
-# ── Resolve the query suite ──────────────────────────────────────────────────
-$suite = 'cpp-security-and-quality.qls'   # safe default shipped with the bundle
-if (-not $DriverSuiteRepo) {
-    $DriverSuiteRepo = Join-Path $RsCertRoot '.tools\windows-drivers'
-    if (-not (Test-Path $DriverSuiteRepo) -and (Get-Command git -ErrorAction SilentlyContinue)) {
-        Write-RsInfo 'Cloning the Windows driver CodeQL suite ...'
-        try {
-            & git clone --depth 1 `
-                https://github.com/microsoft/Windows-Driver-Developer-Supplemental-Tools.git `
-                $DriverSuiteRepo 2>&1 | Out-Null
-        } catch { Write-RsWarn "Driver suite clone failed; using $suite." }
-    }
-}
-$driverQls = Get-ChildItem $DriverSuiteRepo -Filter 'windows_driver_recommended.qls' `
-              -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($driverQls) { $suite = $driverQls.FullName; Write-RsInfo "Driver suite: $suite" }
-else { Write-RsWarn "Windows driver suite not found; using built-in $suite." }
+# ── Query suite ──────────────────────────────────────────────────────────────
+# A pack reference (pack@version:path), not a cloned repository: a .qls file
+# taken out of its pack cannot resolve the suites it imports ("is not in a
+# pack, so we don't know what to resolve it against").
+$suite = $Suite
+Write-RsInfo "Query suite: $suite"
 
 # ── Create the database (traced build) ───────────────────────────────────────
 $dbDir = Join-Path $EvidenceDir 'codeql-db'
@@ -136,7 +126,7 @@ $pass = ($errors.Count -eq 0)
 Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'CodeQL' `
     -Status ($(if ($pass) { 'Pass' } else { 'Fail' })) `
     -Details @{
-        suite        = (Split-Path $suite -Leaf)
+        suite        = $suite
         totalResults = $results.Count
         errorResults = $errors.Count
     } `

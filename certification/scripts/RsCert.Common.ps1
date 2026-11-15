@@ -142,6 +142,37 @@ function Get-RsSarifResults {
     return ,$results.ToArray()
 }
 
+function Get-RsSarifToolProblems {
+    <#
+      Returns why a SARIF producer did not complete its analysis: each
+      invocation with executionSuccessful = false, and each error-level tool
+      execution or configuration notification (for example BinSkim's
+      ERR997.ExceptionLoadingPdb when it cannot load a PDB, which leaves most
+      of its rules unevaluated). Empty when the analysis completed.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $doc      = Get-Content -Path $Path -Raw | ConvertFrom-Json
+    $problems = New-Object System.Collections.Generic.List[string]
+    foreach ($run in (@(Get-RsProp $doc 'runs') | Where-Object { $null -ne $_ })) {
+        foreach ($inv in (@(Get-RsProp $run 'invocations') | Where-Object { $null -ne $_ })) {
+            if ((Get-RsProp $inv 'executionSuccessful') -eq $false) {
+                $problems.Add('execution did not complete (executionSuccessful = false)')
+            }
+            foreach ($kind in 'toolExecutionNotifications', 'toolConfigurationNotifications') {
+                foreach ($n in (@(Get-RsProp $inv $kind) | Where-Object { $null -ne $_ })) {
+                    if ((Get-RsProp $n 'level') -eq 'error') {
+                        $id   = Get-RsProp (Get-RsProp $n 'descriptor') 'id'
+                        $text = Get-RsProp (Get-RsProp $n 'message') 'text'
+                        $problems.Add(('{0}: {1}' -f $id, $text))
+                    }
+                }
+            }
+        }
+    }
+    return ,$problems.ToArray()
+}
+
 # ── Evidence directory ───────────────────────────────────────────────────────
 function New-RsEvidenceDir {
     <# Creates certification\evidence\<timestamp>\ and records it in LATEST.txt. #>
