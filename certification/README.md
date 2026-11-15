@@ -52,6 +52,10 @@ Produces `certification\evidence\<timestamp>-Release\` with per-gate
 `*.result.json`, logs/SARIF, the signed package, `environment.json`, and an
 aggregated `gate-report.md` / `gate-report.json`.
 
+The packaging gate checks the catalog signature, so the test certificate
+(`CN=RansomShield Test Signing`) must be trusted on that machine:
+`Deploy-RansomShield.ps1` trusts it, and CI trusts a throwaway one on its runner.
+
 **On a WDK machine** (adds SDV + DVL):
 
 ```powershell

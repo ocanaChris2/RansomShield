@@ -124,12 +124,18 @@ $verify = & $signtool verify /v /pa "$stagedCat" 2>&1 | Out-String
 $verify | Set-Content -Path (Join-Path $EvidenceDir 'package.signature.txt') -Encoding UTF8
 $catSig = Get-AuthenticodeSignature $stagedCat
 $pass = ($catSig.Status -eq 'Valid')
+if (-not $pass) {
+    Write-RsFail "Catalog signature: $($catSig.Status). $($catSig.StatusMessage)"
+    Write-RsInfo 'An untrusted root means this machine does not trust the test certificate.'
+    Write-RsInfo 'Deploy-RansomShield.ps1 trusts it (LocalMachine\Root and TrustedPublisher); CI does the same before the gates.'
+}
 
 Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'PackageDriver' `
     -Status ($(if ($pass) { 'Pass' } else { 'Fail' })) `
     -Details @{
         catalog        = 'RansomShield.cat'
         catalogStatus  = "$($catSig.Status)"
+        catalogMessage = "$($catSig.StatusMessage)"
         signer         = "$($catSig.SignerCertificate.Subject)"
         sysSha256      = (Get-RsSha256 (Join-Path $pkg 'RansomShield.sys'))
         note           = 'Test cert used; substitute the EV cert for production attestation.'

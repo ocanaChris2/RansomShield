@@ -91,6 +91,57 @@ function Get-RsSha256 {
     return (Get-FileHash -Path $Path -Algorithm SHA256).Hash
 }
 
+# ── SARIF ────────────────────────────────────────────────────────────────────
+function Get-RsProp {
+    <# Reads an optional property; $null when it is absent (safe under Set-StrictMode). #>
+    param($Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $null }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) { return $prop.Value }
+    return $null
+}
+
+function Get-RsSarifResults {
+    <#
+      Returns every result in a SARIF 2.1.0 log as { RuleId, Level, Message }.
+      Level is the effective level: the result's own level, else its rule's
+      defaultConfiguration.level (rules live in tool.driver and, for CodeQL
+      query packs, in tool.extensions), else 'warning', the SARIF default.
+      Producers leave out default values, so every optional property is read
+      with Get-RsProp: a plain $result.level throws under Set-StrictMode when
+      the property is missing.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $doc     = Get-Content -Path $Path -Raw | ConvertFrom-Json
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($run in (@(Get-RsProp $doc 'runs') | Where-Object { $null -ne $_ })) {
+        $tool       = Get-RsProp $run 'tool'
+        $defaults   = @{}
+        $components = @(Get-RsProp $tool 'driver') + @(Get-RsProp $tool 'extensions')
+        foreach ($component in ($components | Where-Object { $null -ne $_ })) {
+            foreach ($rule in (@(Get-RsProp $component 'rules') | Where-Object { $null -ne $_ })) {
+                $id    = Get-RsProp $rule 'id'
+                $level = Get-RsProp (Get-RsProp $rule 'defaultConfiguration') 'level'
+                if ($id -and $level -and -not $defaults.ContainsKey($id)) { $defaults[$id] = $level }
+            }
+        }
+        foreach ($result in (@(Get-RsProp $run 'results') | Where-Object { $null -ne $_ })) {
+            $ruleId = Get-RsProp $result 'ruleId'
+            if (-not $ruleId) { $ruleId = Get-RsProp (Get-RsProp $result 'rule') 'id' }
+            $level = Get-RsProp $result 'level'
+            if (-not $level -and $ruleId -and $defaults.ContainsKey($ruleId)) { $level = $defaults[$ruleId] }
+            if (-not $level) { $level = 'warning' }
+            $results.Add([pscustomobject]@{
+                RuleId  = $ruleId
+                Level   = $level
+                Message = (Get-RsProp (Get-RsProp $result 'message') 'text')
+            })
+        }
+    }
+    return ,$results.ToArray()
+}
+
 # ── Evidence directory ───────────────────────────────────────────────────────
 function New-RsEvidenceDir {
     <# Creates certification\evidence\<timestamp>\ and records it in LATEST.txt. #>

@@ -3,10 +3,11 @@
     CodeQL gate for the RansomShield driver (Windows driver query suite).
 
 .DESCRIPTION
-    Builds a CodeQL database by compiling RansomShield.vcxproj under CodeQL
-    tracing, then analyzes it with the Windows driver recommended query suite
-    (falling back to cpp-security-and-quality if the driver suite is absent) and
-    emits SARIF. CodeQL is the modern Microsoft Hardware Dev Center submission
+    Builds a CodeQL database by compiling the driver project (through
+    RansomShield.sln) under CodeQL tracing, then analyzes it with the Windows
+    driver recommended query suite (falling back to cpp-security-and-quality if
+    the driver suite is absent) and emits SARIF. CodeQL is the modern Microsoft
+    Hardware Dev Center submission
     requirement.
 
     Bootstrapping (first run; needs network):
@@ -96,8 +97,11 @@ else { Write-RsWarn "Windows driver suite not found; using built-in $suite." }
 
 # ── Create the database (traced build) ───────────────────────────────────────
 $dbDir = Join-Path $EvidenceDir 'codeql-db'
-$buildCmd = '"{0}" "{1}" /p:Configuration={2} /p:Platform=x64 /p:SolutionDir="{3}\" /t:Rebuild /v:minimal /nologo' `
-            -f $msbuild, (Join-Path $RsRepoRoot 'RansomShield.vcxproj'), $Configuration, $RsRepoRoot
+# Build the driver project through the solution, which sets SolutionDir itself.
+# CodeQL splits --command into arguments on its own and rejects a quote inside
+# an argument, such as /p:SolutionDir="C:\path\".
+$buildCmd = '"{0}" "{1}" /t:RansomShield:Rebuild /p:Configuration={2} /p:Platform=x64 /v:minimal /nologo' `
+            -f $msbuild, (Join-Path $RsRepoRoot 'RansomShield.sln'), $Configuration
 
 Write-RsInfo 'Creating CodeQL database (this compiles the driver) ...'
 & $codeql database create "$dbDir" --language=cpp --overwrite --command=$buildCmd 2>&1 |
@@ -116,17 +120,16 @@ $sarif = Join-Path $EvidenceDir 'codeql.sarif'
     Tee-Object -FilePath (Join-Path $EvidenceDir 'codeql.analyze.log') | Out-Null
 
 if (-not (Test-Path $sarif)) {
-    Write-RsFail 'CodeQL analysis produced no SARIF.'
+    Write-RsFail 'CodeQL analysis produced no SARIF (see codeql.analyze.log).'
     Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'CodeQL' -Status 'Fail' `
-        -Details @{ reason = 'no SARIF produced' } | Out-Null
+        -Details @{ reason = 'no SARIF produced' } -Artifacts @('codeql.analyze.log') | Out-Null
     exit 1
 }
 
-$doc = Get-Content $sarif -Raw | ConvertFrom-Json
-$results = @()
-foreach ($run in $doc.runs) { if ($run.results) { $results += $run.results } }
-$errors = @($results | Where-Object { $_.level -eq 'error' })
-($results | Group-Object ruleId, level | ForEach-Object { "{0,-6} {1}" -f $_.Count, $_.Name }) |
+# Error-level results (effective level, see Get-RsSarifResults).
+$results = Get-RsSarifResults -Path $sarif
+$errors = @($results | Where-Object { $_.Level -eq 'error' })
+($results | Group-Object RuleId, Level | ForEach-Object { "{0,-6} {1}" -f $_.Count, $_.Name }) |
     Set-Content -Path (Join-Path $EvidenceDir 'codeql.summary.txt') -Encoding UTF8
 
 $pass = ($errors.Count -eq 0)
@@ -137,7 +140,10 @@ Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'CodeQL' `
         totalResults = $results.Count
         errorResults = $errors.Count
     } `
-    -Artifacts @('codeql.sarif','codeql.summary.txt') | Out-Null
+    -Artifacts @('codeql.sarif','codeql.summary.txt','codeql.analyze.log') | Out-Null
 
-if (-not $pass) { exit 1 }
+if (-not $pass) {
+    $errors | Select-Object -First 25 | ForEach-Object { Write-RsInfo ("{0}: {1}" -f $_.RuleId, $_.Message) }
+    exit 1
+}
 exit 0
