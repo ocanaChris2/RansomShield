@@ -217,7 +217,7 @@ $msbuild = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Curren
 # Debug (symbols, no optimization)
 & $msbuild RansomShield.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:SolutionDir="$PWD\" /v:minimal /nologo
 
-# Release (MaxSpeed, COMDAT folding, no PDB)
+# Release (MaxSpeed, COMDAT folding; the PDB is kept for analysis, not shipped)
 & $msbuild RansomShield.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir="$PWD\" /v:minimal /nologo
 ```
 
@@ -235,12 +235,13 @@ The driver is built as `ConfigurationType=DynamicLibrary` (not the WDK "Driver" 
 | `EntryPointSymbol` | `GsDriverEntry` | Security-cookie wrapper that calls `DriverEntry` |
 | `IgnoreAllDefaultLibraries` | `true` | Excludes all user-mode CRT libs |
 | `/kernel` | compiler flag | Enables kernel-mode code generation |
-| `/GS-` | compiler flag | Disables CRT stack cookie (using `BufferOverflowK.lib` instead) |
+| `BufferSecurityCheck` | `true` (`/GS`) | Stack cookies, as in WDK driver projects; the kernel-mode support comes from `BufferOverflowK.lib` |
+| `ControlFlowGuard` | `Guard` (`/guard:cf`, compiler and linker) | Control Flow Guard, as in WDK driver projects |
 | `ExceptionHandling` | `false` | No C++ SEH in kernel mode |
-| `BufferSecurityCheck` | `false` | Paired with `/GS-` above |
 | `RuntimeLibrary` | `MultiThreaded` | Static, no CRT DLL reference |
 | Linked libs | `ntoskrnl.lib fltMgr.lib BufferOverflowK.lib hal.lib wdmsec.lib` | All from WDK NuGet package |
 | `/INTEGRITYCHECK` | linker flag | Required by `PsSetCreateProcessNotifyRoutineEx` (process-exit tracking). The driver must then be signed to load; a test signature is enough |
+| `GenerateDebugInformation` | `true`, Release included | BinSkim reads the compiler options from the PDB; `/PDBALTPATH:%_PDB%` keeps the build path out of the driver |
 
 **Troubleshooting — driver build errors:**
 
