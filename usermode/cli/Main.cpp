@@ -119,8 +119,17 @@ static int CmdSetThreshold(int argc, wchar_t* argv[])
 
     ULONG fileCount = static_cast<ULONG>(_wtoi(argv[2]));
     ULONG seconds   = static_cast<ULONG>(_wtoi(argv[3]));
-    if (fileCount == 0 || seconds == 0) {
-        fwprintf(stderr, L"RansomShield: Both values must be > 0.\n");
+
+    //
+    // Same ranges the driver enforces (SharedDefs.h). Non-numeric input
+    // parses as 0 and negative input wraps to a huge value; both fall
+    // outside the ranges.
+    //
+    if (fileCount < RS_MIN_FILE_COUNT_THRESHOLD || fileCount > RS_MAX_FILE_COUNT_THRESHOLD ||
+        seconds < RS_MIN_TIME_WINDOW_SECONDS || seconds > RS_MAX_TIME_WINDOW_SECONDS) {
+        fwprintf(stderr, L"RansomShield: <fileCount> must be %d-%d and <seconds> %d-%d.\n",
+                 RS_MIN_FILE_COUNT_THRESHOLD, RS_MAX_FILE_COUNT_THRESHOLD,
+                 RS_MIN_TIME_WINDOW_SECONDS, RS_MAX_TIME_WINDOW_SECONDS);
         return 1;
     }
 

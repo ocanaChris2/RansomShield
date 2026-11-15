@@ -105,6 +105,12 @@ RsInstanceTeardownCompleteCallback(
     _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags
     );
 
+static
+VOID
+RsTeardown(
+    VOID
+    );
+
 //
 // ============================================================================
 // GLOBAL STATE
@@ -401,11 +407,26 @@ DriverEntry(
     status = RsInitializeContextTracking();
     if (!NT_SUCCESS(status)) {
         DbgPrint("RansomShield: RsInitializeContextTracking FAILED - 0x%08X\n", status);
-        goto Error_UnregisterFilter;
+        goto Error;
     }
 
     //
-    // ---- STEP 3: Create the communication port ----
+    // ---- STEP 3: Track process exit ----
+    //
+    // Releases a process's context when it exits, so non-paged pool stays
+    // bounded by the live process population and a reused PID never
+    // inherits a block. Not fatal: if registration fails (for example the
+    // image was not linked with /INTEGRITYCHECK), the RS_MAX_TRACKED_PIDS
+    // cap with LRU eviction still bounds memory.
+    //
+    status = RsStartProcessLifecycleTracking();
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("RansomShield: PsSetCreateProcessNotifyRoutineEx FAILED - 0x%08X "
+                 "(continuing; tracking is bounded by the PID cap only)\n", status);
+    }
+
+    //
+    // ---- STEP 4: Create the communication port ----
     //
     // This creates a port that user-mode clients can connect to via
     // FilterConnectCommunicationPort(). The port allows bidirectional
@@ -416,11 +437,11 @@ DriverEntry(
     status = RsInitializeCommPort(g_FilterHandle);
     if (!NT_SUCCESS(status)) {
         DbgPrint("RansomShield: RsInitializeCommPort FAILED - 0x%08X\n", status);
-        goto Error_DestroyContextTracking;
+        goto Error;
     }
 
     //
-    // ---- STEP 4: Start filtering ----
+    // ---- STEP 5: Start filtering ----
     //
     // FltStartFiltering tells the filter manager to begin invoking our
     // callbacks for matching I/O operations. After this call, our Pre
@@ -432,7 +453,7 @@ DriverEntry(
     status = FltStartFiltering(g_FilterHandle);
     if (!NT_SUCCESS(status)) {
         DbgPrint("RansomShield: FltStartFiltering FAILED - 0x%08X\n", status);
-        goto Error_DestroyCommPort;
+        goto Error;
     }
 
     DbgPrint("RansomShield: DriverEntry - Successfully started filtering\n");
@@ -442,22 +463,56 @@ DriverEntry(
     return STATUS_SUCCESS;
 
     //
-    // ---- Error handling with structured cleanup ----
-    // If any step fails, we unwind in reverse order (LIFO) to ensure
-    // no resources are leaked. Each cleanup step is idempotent or
-    // safe to call even if the corresponding init step partially failed.
+    // ---- Error handling ----
+    // The same teardown as unload. Every step in RsTeardown is safe to run
+    // even if the matching initialization step never happened.
     //
-Error_DestroyCommPort:
-    RsDestroyCommPort();
-
-Error_DestroyContextTracking:
-    RsDestroyContextTracking();
-
-Error_UnregisterFilter:
-    FltUnregisterFilter(g_FilterHandle);
-    g_FilterHandle = NULL;
+Error:
+    RsTeardown();
 
     return status;
+}
+
+// ============================================================================
+// TEARDOWN (shared by unload and a failed DriverEntry)
+// ============================================================================
+
+/*++
+Routine Description:
+    Releases everything DriverEntry set up, in an order that guarantees no
+    callback can run against freed state:
+
+      1. Close the server port: no new user-mode connections.
+      2. FltUnregisterFilter: the filter manager tears down every instance,
+         waits for all in-flight pre/post-operation callbacks to return,
+         and calls RsDisconnectNotifyCallback for a client that is still
+         connected (that callback closes the client port). After it
+         returns, no I/O callback can run.
+      3. Remove the process-notify routine. Removal waits for in-flight
+         notifications, so no exit notification can touch the table.
+      4. Free the per-PID table: nothing can reach it any more.
+
+    Freeing the table before step 2 would race with callbacks still in
+    flight: they could use freed contexts, or insert new ones that are
+    never freed (a pool leak Driver Verifier reports at unload).
+
+    IRQL: PASSIVE_LEVEL.
+--*/
+static
+VOID
+RsTeardown(
+    VOID
+    )
+{
+    RsDestroyCommPort();
+
+    if (g_FilterHandle != NULL) {
+        FltUnregisterFilter(g_FilterHandle);
+        g_FilterHandle = NULL;
+    }
+
+    RsStopProcessLifecycleTracking();
+    RsDestroyContextTracking();
 }
 
 // ============================================================================
@@ -471,14 +526,11 @@ Routine Description:
       - Service stop: 'net stop RansomShield'
       - System shutdown
 
-    CLEANUP ORDERING (reverse of initialization):
-    1. Close the communication port (stops new user-mode connections).
-    2. Destroy the context tracking subsystem (frees all contexts).
-    3. Unregister the filter (tells filter manager to stop calling us).
-
-    After this function returns, the filter manager guarantees that no
-    more callbacks will be invoked. It waits for all in-progress callbacks
-    to complete before calling this routine.
+    CLEANUP ORDERING: see RsTeardown. The filter manager does NOT drain
+    in-flight callbacks before calling this routine; pre/post-operation
+    callbacks may still be running on other threads when it starts.
+    FltUnregisterFilter (step 2 of RsTeardown) is what waits for them, so
+    all state they use is freed only after it returns.
 
     IRQL: PASSIVE_LEVEL.
 
@@ -500,29 +552,12 @@ RsUnloadCallback(
     DbgPrint("RansomShield: UnloadCallback - Shutting down...\n");
 
     //
-    // Step 1: Destroy communication port. This closes the server port
-    // and any connected client ports. After this, no user-mode messages
-    // can be sent or received.
+    // Close the port, unregister (drains callbacks), stop process
+    // tracking, then free the per-PID table. The image itself is unloaded
+    // only after this routine returns, so running cleanup after
+    // FltUnregisterFilter is safe.
     //
-    RsDestroyCommPort();
-
-    //
-    // Step 2: Destroy context tracking. Frees all per-PID contexts.
-    //
-    RsDestroyContextTracking();
-
-    //
-    // Step 3: Unregister the filter. This is the LAST step because
-    // once unregistered, the filter manager may unload the driver image.
-    // We must ensure all our code has finished executing before this.
-    //
-    // FltUnregisterFilter also waits for all outstanding callbacks to
-    // complete, so by the time it returns, no callback is using our code.
-    //
-    if (g_FilterHandle != NULL) {
-        FltUnregisterFilter(g_FilterHandle);
-        g_FilterHandle = NULL;
-    }
+    RsTeardown();
 
     DbgPrint("RansomShield: UnloadCallback - Shutdown complete\n");
     return STATUS_SUCCESS;

@@ -89,6 +89,9 @@
     <Link>
       <!-- The Filter Manager import lib; fltMgr.lib comes from the installed WDK. -->
       <AdditionalDependencies>%(AdditionalDependencies);fltMgr.lib</AdditionalDependencies>
+      <!-- /INTEGRITYCHECK: required by PsSetCreateProcessNotifyRoutineEx (process-exit
+           tracking). The image must then be signed to load (test signature is fine). -->
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <!-- Stamp DriverVer/version into the INF at build time (matches RansomShield.rc). -->
     <Inf>

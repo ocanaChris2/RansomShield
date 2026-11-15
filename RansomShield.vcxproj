@@ -140,6 +140,9 @@
       <EntryPointSymbol>GsDriverEntry</EntryPointSymbol>
       <!-- Exclude all user-mode CRT default libs; kernel uses ntoskrnl instead -->
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <!-- /INTEGRITYCHECK: required by PsSetCreateProcessNotifyRoutineEx (process-exit
+           tracking). The image must then be signed to load (test signature is fine). -->
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <!-- Kernel drivers cannot have a side-by-side manifest -->
     </Link>
@@ -167,6 +170,8 @@
       <Driver>WDM</Driver>
       <EntryPointSymbol>GsDriverEntry</EntryPointSymbol>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <!-- /INTEGRITYCHECK: see the Debug configuration. -->
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
