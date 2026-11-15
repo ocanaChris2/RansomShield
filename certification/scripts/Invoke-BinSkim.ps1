@@ -110,16 +110,16 @@ if (-not $binskim) {
 Write-RsInfo "BinSkim: $binskim"
 
 # BinSkim 4.x takes --output for the SARIF log (this version has no
-# --pretty-print option). --insert FlattenedMessages writes each result's
-# message as text: BinSkim otherwise emits message templates, which GitHub
-# code scanning rejects ("expected a result message"). A stale log is removed
-# first so BinSkim never has to overwrite one, and its console output is kept.
+# --pretty-print option). Its results carry message templates (an id plus
+# arguments) instead of text, which GitHub code scanning does not accept
+# ("expected a result message"); the evidence keeps the log exactly as BinSkim
+# wrote it. A stale log is removed first so BinSkim never has to overwrite one,
+# and its console output is kept.
 $sarif      = Join-Path $EvidenceDir 'binskim.sarif'
 $analyzeLog = Join-Path $EvidenceDir 'binskim.analyze.log'
 Remove-Item -LiteralPath $sarif -ErrorAction SilentlyContinue
 try {
-    & $binskim analyze "$sys" --output "$sarif" --insert FlattenedMessages 2>&1 |
-        Out-File -FilePath $analyzeLog -Encoding utf8
+    & $binskim analyze "$sys" --output "$sarif" 2>&1 | Out-File -FilePath $analyzeLog -Encoding utf8
 } catch { "binskim raised: $($_.Exception.Message)" | Add-Content -Path $analyzeLog }
 $binskimExit = $LASTEXITCODE
 

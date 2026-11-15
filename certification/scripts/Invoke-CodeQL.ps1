@@ -30,13 +30,19 @@
     Query suite to run. Default: the recommended suite of Microsoft's published
     microsoft/windows-drivers CodeQL pack, pinned to the version the Windows
     driver docs list for current development ("Static Tools and CodeQL",
-    learn.microsoft.com); CodeQL downloads the pack on first use (--download).
+    learn.microsoft.com).
+
+.PARAMETER Packs
+    Query packs downloaded before the analysis: the driver pack and the
+    microsoft/cpp-queries pack its suites import, at the versions the same
+    docs pair for current development.
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Debug','Release')][string]$Configuration = 'Release',
     [string]$EvidenceDir,
-    [string]$Suite = 'microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls'
+    [string]$Suite = 'microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls',
+    [string[]]$Packs = @('microsoft/windows-drivers@1.10.0', 'microsoft/cpp-queries@0.0.5')
 )
 
 Set-StrictMode -Version Latest
@@ -84,6 +90,21 @@ Write-RsInfo "CodeQL: $codeql"
 # pack, so we don't know what to resolve it against").
 $suite = $Suite
 Write-RsInfo "Query suite: $suite"
+
+# The driver suites import queries from a second pack, microsoft/cpp-queries,
+# which `database analyze --download` does not fetch ("The QL pack ... cannot
+# be found"). Download both up front, before the build, so a missing pack
+# fails fast.
+$packLog = Join-Path $EvidenceDir 'codeql.packs.log'
+Write-RsInfo "Downloading query packs: $($Packs -join ', ')"
+& $codeql pack download @Packs 2>&1 | Out-File -FilePath $packLog -Encoding utf8
+if ($LASTEXITCODE -ne 0) {
+    Write-RsFail 'CodeQL query pack download failed (see codeql.packs.log).'
+    Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'CodeQL' -Status 'Fail' `
+        -Details @{ reason = 'query pack download failed'; packs = $Packs } `
+        -Artifacts @('codeql.packs.log') | Out-Null
+    exit 1
+}
 
 # ── Create the database (traced build) ───────────────────────────────────────
 $dbDir = Join-Path $EvidenceDir 'codeql-db'
