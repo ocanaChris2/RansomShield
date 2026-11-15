@@ -18,8 +18,10 @@ Abstract:
     compilable by rc.exe regardless of which include paths are configured, and is
     a no-op when the real headers are present.
 
-    FILEVERSION / PRODUCTVERSION are kept in lock-step with DriverVer in
-    RansomShield.inf (1.0.0.0). Update all three together when releasing.
+    FILEVERSION / PRODUCTVERSION and the version strings must match DriverVer
+    in RansomShield.inf. Do not edit them by hand: run
+    certification\scripts\Set-RsVersion.ps1 -Version a.b.c.d, which updates
+    all of them (the release workflow runs it from the git tag).
 --*/
 
 #ifndef VS_VERSION_INFO

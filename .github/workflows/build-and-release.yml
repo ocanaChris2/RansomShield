@@ -1,0 +1,326 @@
+name: Build and release
+
+# Builds RansomShield (driver, CLI client, tray agent) on a GitHub-hosted
+# runner, runs the host-runnable certification gates, and publishes a GitHub
+# Release when a version tag is pushed.
+#
+#   pull request             build + gates (CodeQL skipped to keep PRs quick)
+#   push to main             build + all gates
+#   push tag vX.Y.Z[-pre]    build + all gates + GitHub Release (version X.Y.Z.0)
+#   manual run               build + all gates
+#
+# Runner: windows-2025 = Windows Server 2025 + Visual Studio 2026 (v145
+# toolset). The WDK/SDK headers and libraries come from the NuGet packages
+# pinned in packages.config, so no WDK install is needed.
+#
+# Release assets are a TEST build: RansomShield.sys is unsigned, and
+# Deploy-RansomShield.ps1 signs it with a local test certificate on the target
+# machine (test signing on, Memory Integrity off). Production signing (EV
+# certificate + Microsoft attestation) is roadmap Stage 2 and is not wired here.
+#
+# Supply chain: every action is pinned to a full commit SHA (version in the
+# trailing comment). Only the release job can write to the repository.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+    paths-ignore:              # not applied to tag pushes
+      - '**/*.md'
+      - 'certification/docs/**'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'certification/docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}   # never cancel a release run
+
+jobs:
+  build:
+    name: Build + certification gates (Release x64)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      security-events: write   # publish CodeQL / BinSkim SARIF to code scanning
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag') {
+            if ($env:REF_NAME -match '^v(\d{1,5})\.(\d{1,5})\.(\d{1,5})(-[0-9A-Za-z.-]+)?$') {
+              $version    = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
+              $prerelease = if ($Matches[4]) { 'true' } else { 'false' }
+              $tag        = $env:REF_NAME
+            } else {
+              throw "Tag '$env:REF_NAME' must look like v1.2.3 or v1.2.3-rc.1"
+            }
+          } else {
+            # Not a release: keep the version already in the sources.
+            if ((Get-Content RansomShield.inf -Raw) -match '(?m)^DriverVer\s*=\s*[0-9/]+,(\d+\.\d+\.\d+\.\d+)') {
+              $version = $Matches[1]
+            } else {
+              throw 'DriverVer not found in RansomShield.inf'
+            }
+            $prerelease = 'false'
+            $tag        = ''
+          }
+          "tag=$tag"               >> $env:GITHUB_OUTPUT
+          "version=$version"       >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
+          Write-Host "version $version, tag '$tag', prerelease $prerelease"
+
+      - name: Stamp the tag's version into the sources
+        if: github.ref_type == 'tag'
+        env:
+          RS_VERSION: ${{ steps.version.outputs.version }}
+        run: ./certification/scripts/Set-RsVersion.ps1 -Version $env:RS_VERSION
+
+      - name: Show toolchain
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          Write-Host ("Visual Studio: {0} {1}" -f (& $vswhere -latest -products * -property displayName), (& $vswhere -latest -products * -property installationVersion))
+          Write-Host ("PowerShell:    {0}" -f $PSVersionTable.PSVersion)
+          nuget help | Select-Object -First 1
+
+      - name: Cache NuGet packages
+        if: github.ref_type != 'tag'   # release builds always restore fresh from nuget.org
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('packages.config') }}
+
+      - name: Restore WDK/SDK NuGet packages
+        run: |
+          nuget restore RansomShield.sln -PackagesDirectory packages -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "nuget restore failed ($LASTEXITCODE)" }
+
+      - name: Certification gates
+        env:
+          SKIP_CODEQL: ${{ github.event_name == 'pull_request' }}
+        run: |
+          $gateArgs = @{ Configuration = 'Release' }
+          if ($env:SKIP_CODEQL -eq 'true') { $gateArgs.SkipCodeQL = $true }
+          ./certification/scripts/Invoke-AllGates.ps1 @gateArgs
+
+      - name: Collect evidence (reports, logs, SARIF)
+        id: evidence
+        if: always()
+        run: |
+          $dir = $null
+          $latest = 'certification/evidence/LATEST.txt'
+          if (Test-Path $latest) { $dir = (Get-Content $latest -Raw).Trim() }
+          if (-not $dir -or -not (Test-Path $dir)) {
+            $dir = Get-ChildItem certification/evidence -Directory -ErrorAction SilentlyContinue |
+                   Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $dir) { Write-Host 'No evidence bundle produced.'; exit 0 }
+
+          # Leave out the CodeQL database (hundreds of MB) and the test-signed
+          # package binaries (signed with a throwaway certificate of this run).
+          $out = Join-Path $env:RUNNER_TEMP 'evidence'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item (Join-Path $dir '*') $out -Recurse -Exclude 'codeql-db'
+          Get-ChildItem $out -Recurse -File -Include *.sys, *.cat | Remove-Item -Force
+
+          "dir=$out" >> $env:GITHUB_OUTPUT
+          $report = Join-Path $out 'gate-report.md'
+          if (Test-Path $report) { Get-Content $report -Raw >> $env:GITHUB_STEP_SUMMARY }
+
+      - name: Publish CodeQL results to code scanning
+        if: always() && steps.evidence.outputs.dir != '' && github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.evidence.outputs.dir }}/codeql.sarif
+          category: codeql-driver
+
+      - name: Publish BinSkim results to code scanning
+        if: always() && steps.evidence.outputs.dir != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.evidence.outputs.dir }}/binskim.sarif
+          category: binskim
+
+      - name: Upload certification evidence
+        if: always() && steps.evidence.outputs.dir != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: certification-evidence
+          path: ${{ steps.evidence.outputs.dir }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Build release binaries (clean)
+        run: |
+          # The gates rebuild the driver with analysis and CodeQL tracing; the
+          # shipped binaries come from a plain Release build of the solution.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild RansomShield.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed ($LASTEXITCODE)" }
+
+      - name: Stage release payload
+        env:
+          RS_TAG: ${{ steps.version.outputs.tag }}
+          RS_VERSION: ${{ steps.version.outputs.version }}
+          EVIDENCE_DIR: ${{ steps.evidence.outputs.dir }}
+        run: |
+          $label = if ($env:RS_TAG) { $env:RS_TAG } else { "$env:RS_VERSION-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $name  = "RansomShield-$label-x64"
+          $dist  = (New-Item -ItemType Directory -Force -Path dist).FullName
+          $root  = (New-Item -ItemType Directory -Force -Path (Join-Path $dist $name)).FullName
+          $bin   = (New-Item -ItemType Directory -Force -Path (Join-Path $root 'x64\Release')).FullName
+
+          # Same layout as the repository, so Deploy-RansomShield.ps1 -SkipBuild
+          # finds everything where it expects it.
+          foreach ($f in 'RansomShield.sys', 'RansomShieldClient.exe', 'RansomShieldTray.exe') {
+            Copy-Item (Join-Path 'x64\Release' $f) $bin
+          }
+          Copy-Item RansomShield.inf, Deploy-RansomShield.ps1, README.md $root
+          New-Item -ItemType Directory -Force -Path (Join-Path $root 'certification') | Out-Null
+          Copy-Item certification\tools   (Join-Path $root 'certification\tools')   -Recurse
+          Copy-Item certification\scripts (Join-Path $root 'certification\scripts') -Recurse
+
+          # sha256sum format with LF line endings, so the files also check on Linux.
+          function Write-Sums([string]$Path, [string[]]$Lines) {
+            [IO.File]::WriteAllText($Path, (($Lines -join "`n") + "`n"))
+          }
+
+          # Hashes of the binaries as built. The deploy script signs
+          # RansomShield.sys on the target machine, which changes its hash.
+          $sums = Get-ChildItem $root -Recurse -File -Include *.sys, *.exe, *.inf | Sort-Object FullName | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $rel  = [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+            "$hash  $rel"
+          }
+          Write-Sums (Join-Path $root 'SHA256SUMS.txt') $sums
+
+          $notes = @'
+          > **Test build.** `RansomShield.sys` in this release is not production-signed. It loads only on a machine with test signing on and Memory Integrity (HVCI) off. Use a dedicated test machine or VM.
+
+          ## Install
+
+          1. Extract `{{ZIP}}` and open an elevated PowerShell in the extracted folder.
+          2. Run `bcdedit /set testsigning on`, then reboot.
+          3. Run `.\Deploy-RansomShield.ps1 -Configuration Release -SkipBuild`.
+
+          The deploy script signs the driver with a local self-signed test certificate (it needs `signtool.exe` from the Windows SDK), installs and loads it, and starts the tray agent. To remove it, run `.\Deploy-RansomShield.ps1 -Action uninstall`.
+
+          The test tools used for verification are in `certification\tools` (test VM only).
+
+          ## Verify the download
+
+          - `SHA256SUMS.txt` on the release page lists the SHA-256 of each asset; the one inside the zip lists the binaries as built.
+          - Build provenance (public repositories): `gh attestation verify {{ZIP}} --repo {{REPO}}`
+
+          Version {{VERSION}}, commit {{SHA}}.
+          '@
+          $notes = $notes.Replace('{{ZIP}}', "$name.zip")
+          $notes = $notes.Replace('{{REPO}}', $env:GITHUB_REPOSITORY)
+          $notes = $notes.Replace('{{VERSION}}', $env:RS_VERSION)
+          $notes = $notes.Replace('{{SHA}}', $env:GITHUB_SHA)
+          Set-Content (Join-Path $root 'INSTALL.md') "# RansomShield $label`n`n$notes" -Encoding utf8
+
+          Compress-Archive -Path $root -DestinationPath (Join-Path $dist "$name.zip") -CompressionLevel Optimal
+          Remove-Item $root -Recurse -Force
+
+          if ($env:EVIDENCE_DIR -and (Test-Path $env:EVIDENCE_DIR)) {
+            Compress-Archive -Path (Join-Path $env:EVIDENCE_DIR '*') `
+              -DestinationPath (Join-Path $dist "RansomShield-$label-certification-evidence.zip") -CompressionLevel Optimal
+          }
+
+          $sums = Get-ChildItem $dist -Filter *.zip | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          Write-Sums (Join-Path $dist 'SHA256SUMS.txt') $sums
+
+          # Release notes: install/verify text plus the gate report of this run.
+          $gates = if ($env:EVIDENCE_DIR -and (Test-Path (Join-Path $env:EVIDENCE_DIR 'gate-report.md'))) {
+            Get-Content (Join-Path $env:EVIDENCE_DIR 'gate-report.md') -Raw
+          } else { '_No gate report was produced._' }
+          Set-Content (Join-Path $dist 'RELEASE_NOTES.md') "$notes`n## Certification gates`n`n$gates" -Encoding utf8
+
+          Get-ChildItem $dist | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+
+      - name: Upload release payload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-payload
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write          # create the release and upload its assets
+      id-token: write          # sign the build provenance attestation
+      attestations: write
+    steps:
+      - name: Download release payload
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-payload
+          path: dist
+
+      - name: Check the payload against its checksums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS.txt
+
+      - name: Attest build provenance
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          assets=(dist/*.zip dist/SHA256SUMS.txt)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (re-run): replacing its assets."
+            gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            flags=()
+            if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "RansomShield $TAG" \
+              --notes-file dist/RELEASE_NOTES.md \
+              --generate-notes \
+              "${flags[@]}"
+          fi

@@ -81,8 +81,11 @@ pwsh certification\scripts\Invoke-DriverVerifier.ps1 -Action query    # capture
 | Functional efficacy / false positive | `tools/RansomSim.ps1`, `tools/Workload-FalsePositive.ps1` | Test VM |
 | Orchestrator | `scripts/Invoke-AllGates.ps1` | aggregates the host-runnable set |
 
-CI runs the host-runnable gates on every push and publishes SARIF + the evidence
-bundle: [`.github/workflows/driver-certification.yml`](../.github/workflows/driver-certification.yml).
+CI runs the host-runnable gates on every pull request and push to `main`
+(GitHub-hosted `windows-2025` runner) and publishes SARIF + the evidence bundle.
+A version tag (`v1.2.3`) additionally publishes a GitHub Release whose assets
+include that run's evidence:
+[`.github/workflows/build-and-release.yml`](../.github/workflows/build-and-release.yml).
 
 ## Related project docs
 

@@ -73,7 +73,8 @@ Each practice lists the **evidence** (a code location, a gate, or an artifact).
 
 - Automated gate orchestrator ([`Invoke-AllGates.ps1`](../scripts/Invoke-AllGates.ps1))
   produces a signed-off evidence bundle; CI runs the host-runnable gates on every
-  push (`.github/workflows/driver-certification.yml`).
+  pull request and push to `main`, and a release is published only from a tag
+  whose build passed them (`.github/workflows/build-and-release.yml`).
 - Runtime verification on a dedicated test VM (Driver Verifier + functional
   efficacy + false-positive tests) per the [test plan](test-plan.md).
 
