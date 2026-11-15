@@ -359,7 +359,7 @@ When building through the `.sln`, MSBuild sets `$(SolutionDir)` automatically â€
 | Push to `main`, manual run | Build + all gates |
 | Tag `vX.Y.Z` or `vX.Y.Z-suffix` | Build + all gates, then a GitHub Release (a suffix such as `-rc.1` makes it a pre-release) |
 
-Each run uploads the gate evidence as the `certification-evidence` artifact and, when the build and gates pass, a ready-to-deploy ZIP as `release-payload`. CodeQL and BinSkim results also go to the repository's code scanning alerts. A failing gate fails the run, so a tag whose build fails a gate publishes nothing. Driver Verifier and the functional tests need a test VM and are not part of CI; see [`certification/README.md`](certification/README.md).
+Each run uploads the gate evidence as the `certification-evidence` artifact and, when the build and gates pass, a ready-to-deploy ZIP as `release-payload`. CodeQL results also go to the repository's code scanning alerts; BinSkim's are in the evidence artifact (code scanning does not accept BinSkim's SARIF as BinSkim writes it). A failing gate fails the run, so a tag whose build fails a gate publishes nothing. Driver Verifier and the functional tests need a test VM and are not part of CI; see [`certification/README.md`](certification/README.md).
 
 ### Publishing a release
 
