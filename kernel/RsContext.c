@@ -1178,6 +1178,7 @@ RsIsProcessAllowlisted(
     )
 {
     ULONG i;
+    ULONG charCount;
     UNICODE_STRING processFileName;
     PWCHAR lastBackslash;
 
@@ -1195,7 +1196,15 @@ RsIsProcessAllowlisted(
     // If no backslash is found, we compare the entire string.
     //
     lastBackslash = ProcessImageName->Buffer;
-    for (i = 0; i < ProcessImageName->Length / sizeof(WCHAR); i++) {
+
+    //
+    // Length is a USHORT byte count, so the character count always fits in
+    // a ULONG. Computing it once keeps the loop bound in the index's own
+    // type (CodeQL cpp/infiniteloop flags a ULONG index compared with the
+    // 64-bit result of the division).
+    //
+    charCount = (ULONG)(ProcessImageName->Length / sizeof(WCHAR));
+    for (i = 0; i < charCount; i++) {
         if (ProcessImageName->Buffer[i] == L'\\') {
             lastBackslash = &ProcessImageName->Buffer[i + 1];
         }
