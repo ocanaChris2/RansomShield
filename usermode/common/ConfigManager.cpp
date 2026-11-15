@@ -48,6 +48,38 @@ Author:
 #include <algorithm>
 #include <cwchar>
 
+//
+// Bring a value read from the registry into the range the driver accepts
+// (RS_MIN/MAX_* in SharedDefs.h); the driver rejects an update with any
+// value outside it. 0 means "unset" and falls back to the default; a value
+// above the maximum is clamped to it, which keeps the user's intent (less
+// sensitive) as far as the driver allows.
+//
+static ULONG SanitizeConfigValue(
+    ULONG value,
+    ULONG minValue,
+    ULONG maxValue,
+    ULONG defaultValue,
+    const wchar_t* valueName)
+{
+    if (value == 0) {
+        fwprintf(stderr, L"RansomShield: %s is 0 in the registry; using the default %lu.\n",
+                 valueName, defaultValue);
+        return defaultValue;
+    }
+    if (value < minValue) {
+        fwprintf(stderr, L"RansomShield: %s=%lu is below the minimum %lu; using %lu.\n",
+                 valueName, value, minValue, minValue);
+        return minValue;
+    }
+    if (value > maxValue) {
+        fwprintf(stderr, L"RansomShield: %s=%lu is above the maximum %lu; using %lu.\n",
+                 valueName, value, maxValue, maxValue);
+        return maxValue;
+    }
+    return value;
+}
+
 ConfigManager::ConfigManager(const wchar_t* registryBasePath)
     : m_fileCountThreshold(RS_DEFAULT_FILE_COUNT_THRESHOLD)
     , m_timeWindowSeconds(RS_DEFAULT_TIME_WINDOW_SECONDS)
@@ -108,10 +140,17 @@ bool ConfigManager::Initialize()
     }
 
     //
-    // Load settings from the registry. Missing values use defaults.
+    // Load settings from the registry. Missing values use defaults;
+    // out-of-range values are brought back into the range the driver accepts.
     //
-    m_fileCountThreshold = ReadDWord(m_hConfigKey, RS_REGVAL_THRESHOLD, RS_DEFAULT_FILE_COUNT_THRESHOLD);
-    m_timeWindowSeconds = ReadDWord(m_hConfigKey, RS_REGVAL_TIMEWINDOW, RS_DEFAULT_TIME_WINDOW_SECONDS);
+    m_fileCountThreshold = SanitizeConfigValue(
+        ReadDWord(m_hConfigKey, RS_REGVAL_THRESHOLD, RS_DEFAULT_FILE_COUNT_THRESHOLD),
+        RS_MIN_FILE_COUNT_THRESHOLD, RS_MAX_FILE_COUNT_THRESHOLD,
+        RS_DEFAULT_FILE_COUNT_THRESHOLD, RS_REGVAL_THRESHOLD);
+    m_timeWindowSeconds = SanitizeConfigValue(
+        ReadDWord(m_hConfigKey, RS_REGVAL_TIMEWINDOW, RS_DEFAULT_TIME_WINDOW_SECONDS),
+        RS_MIN_TIME_WINDOW_SECONDS, RS_MAX_TIME_WINDOW_SECONDS,
+        RS_DEFAULT_TIME_WINDOW_SECONDS, RS_REGVAL_TIMEWINDOW);
     m_monitoringEnabled = (ReadDWord(m_hConfigKey, RS_REGVAL_MONITORING, RS_DEFAULT_MONITORING_ENABLED) != 0);
 
     //
@@ -395,8 +434,14 @@ bool ConfigManager::LoadFromRegistry()
     //
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    m_fileCountThreshold = ReadDWord(m_hConfigKey, RS_REGVAL_THRESHOLD, RS_DEFAULT_FILE_COUNT_THRESHOLD);
-    m_timeWindowSeconds = ReadDWord(m_hConfigKey, RS_REGVAL_TIMEWINDOW, RS_DEFAULT_TIME_WINDOW_SECONDS);
+    m_fileCountThreshold = SanitizeConfigValue(
+        ReadDWord(m_hConfigKey, RS_REGVAL_THRESHOLD, RS_DEFAULT_FILE_COUNT_THRESHOLD),
+        RS_MIN_FILE_COUNT_THRESHOLD, RS_MAX_FILE_COUNT_THRESHOLD,
+        RS_DEFAULT_FILE_COUNT_THRESHOLD, RS_REGVAL_THRESHOLD);
+    m_timeWindowSeconds = SanitizeConfigValue(
+        ReadDWord(m_hConfigKey, RS_REGVAL_TIMEWINDOW, RS_DEFAULT_TIME_WINDOW_SECONDS),
+        RS_MIN_TIME_WINDOW_SECONDS, RS_MAX_TIME_WINDOW_SECONDS,
+        RS_DEFAULT_TIME_WINDOW_SECONDS, RS_REGVAL_TIMEWINDOW);
     m_monitoringEnabled = (ReadDWord(m_hConfigKey, RS_REGVAL_MONITORING, RS_DEFAULT_MONITORING_ENABLED) != 0);
 
     //

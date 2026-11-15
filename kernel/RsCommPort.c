@@ -27,7 +27,7 @@ Abstract:
     │  Message()       │◄────────│  (Pushes block notifications)        │
     │                  │         │                                      │
     │  (disconnect) ───┼────────►│  RsDisconnectNotifyCallback()       │
-    │                  │         │  (Cleans up client port handle)      │
+    │                  │         │  (Closes the client port)            │
     └──────────────────┘         └──────────────────────────────────────┘
 
     THREADING MODEL:
@@ -35,13 +35,17 @@ Abstract:
       in the context of the connecting thread. Serialized by the filter
       manager — only one connect callback is active at a time.
     - MessageNotifyCallback: Called by the filter manager at PASSIVE_LEVEL
-      in the context of the thread that called FilterSendMessage(). The
-      filter manager serializes message callbacks per connection.
+      in the context of the thread that called FilterSendMessage(). Its
+      input and output buffers are raw user-mode buffers: each is copied
+      exactly once (in, then out) inside __try/__except, and never touched
+      while a lock is held.
     - DisconnectNotifyCallback: Called at PASSIVE_LEVEL when the user-mode
-      client closes the handle or the process exits.
+      client closes the handle or the process exits, and from
+      FltUnregisterFilter for a client still connected at unload. It must
+      close the client port with FltCloseClientPort().
     - FltSendMessage: Called from our pre-operation callback context.
-      This MUST be called at PASSIVE_LEVEL (which we guarantee by calling
-      it after releasing the spinlock).
+      It must not be called with a spinlock held (we call it after
+      releasing g_ContextLock).
 
     IMPORTANT NOTES ON FltSendMessage:
     - FltSendMessage() can block (wait) until the user-mode client calls
@@ -77,8 +81,8 @@ PFLT_PORT g_ServerPort = NULL;
 
 //
 // Client port handle. Set by RsConnectNotifyCallback() when a user-mode
-// client connects. Cleared by RsDisconnectNotifyCallback() when the
-// client disconnects.
+// client connects. Closed and cleared by RsDisconnectNotifyCallback()
+// (FltCloseClientPort sets it to NULL).
 //
 // SINGLE CLIENT DESIGN:
 // We only support one connected client at a time. This simplifies the
@@ -92,9 +96,11 @@ PFLT_PORT g_ServerPort = NULL;
 // a linked list of PFLT_PORT entries protected by a mutex.
 //
 // SYNCHRONIZATION:
-// The filter manager guarantees that ConnectNotifyCallback and
-// DisconnectNotifyCallback are serialized, so we don't need an
-// additional lock to protect g_ClientPort.
+// Connect and disconnect callbacks are serialized by the filter manager.
+// The disconnect callback closes the port with FltCloseClientPort(), which
+// sets g_ClientPort to NULL, and RsSendBlockNotification passes
+// &g_ClientPort itself (never a copy) to FltSendMessage(). This is the
+// pattern of the WDK scanner sample.
 //
 PFLT_PORT g_ClientPort = NULL;
 
@@ -111,6 +117,17 @@ PFLT_PORT g_ClientPort = NULL;
 // indicate relative time (as opposed to absolute time).
 //
 LARGE_INTEGER g_MessageTimeout = {.QuadPart = -5 * 10000000}; // 5 seconds, relative
+
+//
+// Largest request the protocol defines. Larger input is rejected before
+// anything is allocated, so a client cannot make the driver allocate
+// arbitrary amounts of non-paged pool.
+//
+#define RS_MAX_REQUEST_SIZE     sizeof(RS_REQUEST_UPDATE_ALLOWLIST_FULL)
+
+C_ASSERT(sizeof(RS_REQUEST_UPDATE_ALLOWLIST_CHUNK) <= RS_MAX_REQUEST_SIZE);
+C_ASSERT(sizeof(RS_REQUEST_UPDATE_CONFIG)          <= RS_MAX_REQUEST_SIZE);
+C_ASSERT(sizeof(RS_REQUEST_UNBLOCK_PID)            <= RS_MAX_REQUEST_SIZE);
 
 //
 // ============================================================================
@@ -242,15 +259,17 @@ RsInitializeCommPort(
 
 /*++
 Routine Description:
-    Destroys the communication port and cleans up resources. Called during
-    driver unload.
+    Closes the server port so no new client can connect. Called from
+    RsTeardown (driver unload, or a failed DriverEntry) BEFORE
+    FltUnregisterFilter.
 
-    CLEANUP ORDER:
-    1. Close the client port (if connected). This triggers the
-       DisconnectNotifyCallback, so we set g_ClientPort = NULL first
-       to prevent the callback from trying to close an already-closed port.
-    2. Close the server port. This prevents new connections.
-    3. Set both handles to NULL for defensive programming.
+    The client port is deliberately NOT closed here. A client that is still
+    connected is disconnected by FltUnregisterFilter, which calls
+    RsDisconnectNotifyCallback, and that callback closes the client port
+    (the WDK scanner sample does the same). Closing it here as well would
+    race with that callback.
+
+    Safe to call when the server port was never created.
 
     IRQL: PASSIVE_LEVEL.
 --*/
@@ -259,24 +278,6 @@ RsDestroyCommPort(
     VOID
     )
 {
-    //
-    // Close the client connection first, if one exists.
-    // FltCloseClientPort closes the handle and triggers the
-    // DisconnectNotifyCallback. We set g_ClientPort = NULL BEFORE
-    // calling FltCloseClientPort to prevent the disconnect callback
-    // from trying to close an already-closing port.
-    //
-    if (g_ClientPort != NULL) {
-        PFLT_PORT clientPort = g_ClientPort;
-        g_ClientPort = NULL;
-        FltCloseClientPort(g_FilterHandle, &clientPort);
-    }
-
-    //
-    // Close the server port. This prevents new client connections.
-    // After this call, any pending FilterConnectCommunicationPort()
-    // calls in user mode will fail.
-    //
     if (g_ServerPort != NULL) {
         FltCloseCommunicationPort(g_ServerPort);
         g_ServerPort = NULL;
@@ -293,17 +294,18 @@ RsDestroyCommPort(
 Routine Description:
     Sends a notification to the connected user-mode client that a PID
     has been blocked. This is called from RsRecordOperation() AFTER
-    releasing the spinlock, so we're at PASSIVE_LEVEL.
+    releasing the spinlock.
 
     IMPORTANT:
-    - This function MUST be called at PASSIVE_LEVEL because FltSendMessage()
-      may need to wait for the user-mode client to read the message.
-    - If no client is connected, FltSendMessage() returns
-      STATUS_FLT_NO_WAITER, which we treat as a non-error.
+    - This function must not be called with a spinlock held because
+      FltSendMessage() may need to wait for the user-mode client to read
+      the message.
+    - If no client is connected, there is nothing to send; the block is
+      already in force regardless.
     - We use a timeout to prevent indefinite blocking if the user-mode
       client is hung.
 
-    IRQL: PASSIVE_LEVEL (caller must guarantee this).
+    IRQL: <= APC_LEVEL, no spinlock held.
 
 Arguments:
     ProcessId           - The PID that was blocked.
@@ -313,7 +315,6 @@ Arguments:
 
 Return Value:
     STATUS_SUCCESS          - Message was sent (or no client connected).
-    STATUS_FLT_NO_WAITER    - No user-mode client connected (not an error).
     Other                   - Unexpected error.
 --*/
 NTSTATUS
@@ -327,28 +328,12 @@ RsSendBlockNotification(
     NTSTATUS status;
     RS_NOTIFICATION_BLOCKED_PID notification;
     KIRQL oldIrql;
-    PFLT_PORT localClientPort;
 
     //
-    // Snapshot the client port handle locally to avoid a race condition.
-    // Between checking g_ClientPort != NULL and calling FltSendMessage(),
-    // the disconnect callback could set g_ClientPort = NULL. If we passed
-    // &g_ClientPort to FltSendMessage after it became NULL, we'd crash.
+    // Fast path: no client connected. A client that disconnects after this
+    // check is handled by FltSendMessage (see below).
     //
-    // By using a local snapshot, we either:
-    //   (a) Have a valid port handle to send on, or
-    //   (b) Have a stale handle if disconnect happened between the snapshot
-    //       and FltSendMessage — but FltSendMessage handles this gracefully
-    //       by returning STATUS_FLT_NO_WAITER or similar.
-    //
-    // IMPORTANT: FltSendMessage() sets *ClientPort = NULL on
-    // STATUS_FLT_NO_WAITER, so we MUST pass a local copy, not &g_ClientPort.
-    // If we passed &g_ClientPort, FltSendMessage would overwrite our global
-    // with NULL, which is actually the correct behavior — but only if we
-    // intended to clear it. Using a local variable is cleaner.
-    //
-    localClientPort = g_ClientPort;
-    if (localClientPort == NULL) {
+    if (g_ClientPort == NULL) {
         return STATUS_SUCCESS;
     }
 
@@ -388,24 +373,21 @@ RsSendBlockNotification(
     // FltSendMessage() sends the message and optionally waits for a reply.
     // Parameters:
     //   FilterHandle  - Our filter handle.
-    //   ClientPort    - The connected client's port handle.
+    //   ClientPort    - Address of the variable holding the client port.
     //   SendBuffer    - The notification data to send.
     //   SendLength    - Size of the send buffer.
     //   ReplyBuffer   - Buffer to receive a reply (NULL = no reply expected).
     //   ReplyLength   - Size of the reply buffer.
     //   Timeout       - Maximum time to wait for the client to read the message.
     //
-    // If the client calls FilterGetMessage(), it receives our notification.
-    // If the client calls FilterReplyMessage(), we could get a reply, but
-    // we don't need one for notifications, so ReplyBuffer = NULL.
-    //
-    // We pass &localClientPort (not &g_ClientPort) because FltSendMessage
-    // sets *ClientPort = NULL on STATUS_FLT_NO_WAITER. Using a local copy
-    // prevents corruption of our global g_ClientPort pointer.
+    // We pass &g_ClientPort itself, not a local copy, as the WDK scanner
+    // sample does. RsDisconnectNotifyCallback closes the port with
+    // FltCloseClientPort(..., &g_ClientPort), which clears this variable; a
+    // copy taken earlier could still point at a port that has been closed.
     //
     status = FltSendMessage(
         g_FilterHandle,
-        &localClientPort,
+        &g_ClientPort,
         &notification,
         sizeof(notification),
         NULL,               // No reply buffer
@@ -491,10 +473,13 @@ RsConnectNotifyCallback(
 /*++
 Routine Description:
     Called by the filter manager when the user-mode client disconnects
-    (closes the port handle, process exits, or driver is unloading).
+    (closes the port handle or exits), and from FltUnregisterFilter for a
+    client still connected when the driver unloads.
 
-    We must clean up the client port handle. The filter manager has
-    already closed the port; we just need to clear our reference.
+    The minifilter owns the client port and must close it here; the filter
+    manager does not. Leaving it open would leak the port and, with
+    MaxConnections = 1, can keep the next client from connecting.
+    FltCloseClientPort also sets g_ClientPort to NULL.
 
     IRQL: PASSIVE_LEVEL.
 
@@ -509,15 +494,7 @@ RsDisconnectNotifyCallback(
 {
     UNREFERENCED_PARAMETER(ConnectionCookie);
 
-    //
-    // The filter manager has already closed the client port.
-    // We just need to clear our stored reference so we don't
-    // try to use a closed handle.
-    //
-    // If g_ClientPort is already NULL (e.g., because RsDestroyCommPort
-    // set it to NULL before calling FltCloseClientPort), this is a no-op.
-    //
-    g_ClientPort = NULL;
+    FltCloseClientPort(g_FilterHandle, &g_ClientPort);
 
     DbgPrint("RansomShield: User-mode client disconnected\n");
 }
@@ -528,31 +505,134 @@ RsDisconnectNotifyCallback(
 
 /*++
 Routine Description:
+    Returns the reply size for a user -> kernel request type. (Request
+    payload sizes are checked inline in each handler case, right where the
+    payload is read.)
+
+Return Value:
+    STATUS_SUCCESS, or STATUS_INVALID_PARAMETER for a type that is not a
+    user -> kernel request.
+--*/
+static
+NTSTATUS
+RsGetReplySize(
+    _In_ RS_MESSAGE_TYPE MessageType,
+    _Out_ PULONG ReplySize
+    )
+{
+    switch (MessageType) {
+
+    case RsQueryBlockedPids:
+        *ReplySize = (ULONG)sizeof(RS_REPLY_BLOCKED_PIDS);
+        break;
+
+    case RsRequestUnblockPid:
+        *ReplySize = (ULONG)sizeof(RS_REPLY_UNBLOCK_PID);
+        break;
+
+    case RsQueryConfig:
+        *ReplySize = (ULONG)sizeof(RS_REPLY_CONFIG);
+        break;
+
+    case RsQueryAllowlist:
+        *ReplySize = (ULONG)sizeof(RS_REPLY_ALLOWLIST);
+        break;
+
+    case RsRequestPause:
+    case RsRequestResume:
+    case RsUpdateConfig:
+    case RsClearAllowlist:
+    case RsUpdateAllowlistChunk:
+    case RsUpdateAllowlistFull:
+        *ReplySize = (ULONG)sizeof(RS_REPLY_GENERIC);
+        break;
+
+    default:
+        *ReplySize = 0;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/*++
+Routine Description:
+    Exception filter for the copies to and from the client's raw user-mode
+    buffers. Handles only the faults a bad or vanishing user buffer can
+    raise: an invalid or unmapped address, a misaligned probe, a paging
+    error on a mapped view. Any other exception is a driver bug and is not
+    swallowed (which is also what Code Analysis rule C6320 asks for).
+--*/
+static
+LONG
+RsUserBufferExceptionFilter(
+    _In_ NTSTATUS ExceptionCode
+    )
+{
+    switch (ExceptionCode) {
+    case STATUS_ACCESS_VIOLATION:
+    case STATUS_DATATYPE_MISALIGNMENT:
+    case STATUS_IN_PAGE_ERROR:
+        return EXCEPTION_EXECUTE_HANDLER;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+
+/*++
+Routine Description:
+    Fills a reply header. Header points into the non-paged kernel reply
+    buffer, so writing it while holding g_ContextLock is legal.
+--*/
+static
+VOID
+RsFillReplyHeader(
+    _Out_ PRS_MESSAGE_HEADER Header,
+    _In_ RS_MESSAGE_TYPE MessageType,
+    _In_ ULONG MessageSize
+    )
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+    Header->SequenceNumber = g_MessageSequence++;
+    KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+    Header->MessageType     = MessageType;
+    Header->MessageSize     = MessageSize;
+    Header->ProtocolVersion = RS_PROTOCOL_VERSION;
+}
+
+/*++
+Routine Description:
     Called by the filter manager when the user-mode client sends a message
-    via FilterSendMessage(). This is the primary request/response handler
-    for user-mode queries.
+    via FilterSendMessage(). This is the request/response handler for all
+    user-mode queries, commands and configuration updates.
 
-    SUPPORTED REQUESTS:
-    1. RsQueryBlockedPids - Returns the list of currently blocked PIDs.
-    2. RsRequestUnblockPid - Unblocks a specific PID.
-
-    PROTOCOL:
-    - The input buffer contains an RS_MESSAGE_HEADER (at minimum) that
-      identifies the request type.
-    - The output buffer receives the reply, which starts with an
-      RS_MESSAGE_HEADER and includes type-specific data.
-    - We validate buffer sizes before processing.
-
-    IRQL: PASSIVE_LEVEL (guaranteed by the filter manager).
+    BUFFER HANDLING:
+    InputBuffer and OutputBuffer are raw user-mode buffers: pageable, and
+    another thread in the client can change or unmap them at any moment.
+    Therefore:
+      1. The request is copied ONCE into a non-paged kernel buffer, inside
+         __try/__except, and only that copy is read afterwards. A field
+         such as EntryCount cannot change between its check and its use.
+      2. The reply is built in a non-paged kernel buffer. Some handlers
+         fill it while holding g_ContextLock (DISPATCH_LEVEL), where
+         touching pageable memory, which includes any user buffer, is a
+         bugcheck.
+      3. The reply is copied out to OutputBuffer at the end, inside
+         __try/__except, with no lock held.
+    Requests larger than RS_MAX_REQUEST_SIZE are rejected before anything
+    is allocated.
 
     DEADLOCK PREVENTION:
-    - We do NOT acquire g_ContextLock while processing messages because:
-      1. RsGetBlockedPids() acquires the lock internally.
-      2. RsUnblockProcess() acquires the lock internally.
-      3. We don't hold the lock across the entire message processing,
-         which would block I/O callbacks for the duration.
+    - No lock is held across the whole message. Each helper
+      (RsGetBlockedPids, RsUnblockProcess, RsApplyConfig, the allowlist
+      routines) takes and releases its own lock.
     - We do NOT call FltSendMessage() from within this callback
       (that would be a recursive send, which is not supported).
+
+    IRQL: PASSIVE_LEVEL (guaranteed by the filter manager).
 
 Arguments:
     PortCookie              - Cookie from ConnectNotifyCallback (unused).
@@ -563,9 +643,13 @@ Arguments:
     ReturnOutputBufferLength - [out] Actual size of the reply data.
 
 Return Value:
-    STATUS_SUCCESS - Request processed successfully.
-    STATUS_BUFFER_TOO_SMALL - Output buffer is too small for the reply.
-    STATUS_INVALID_PARAMETER - Unknown message type or malformed request.
+    STATUS_SUCCESS                - Request processed successfully.
+    STATUS_BUFFER_TOO_SMALL       - Output buffer is too small for the reply;
+                                    *ReturnOutputBufferLength = size needed.
+    STATUS_INVALID_PARAMETER      - Unknown message type, malformed request,
+                                    or an out-of-range configuration value.
+    STATUS_INSUFFICIENT_RESOURCES - The kernel copies could not be allocated.
+    Exception code                - A client buffer was invalid while copying.
 --*/
 NTSTATUS
 RsMessageNotifyCallback(
@@ -578,82 +662,108 @@ RsMessageNotifyCallback(
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
+    PUCHAR request = NULL;          // kernel copy of InputBuffer
+    PUCHAR reply = NULL;            // kernel reply, copied to OutputBuffer at the end
     PRS_MESSAGE_HEADER requestHeader;
+    RS_MESSAGE_TYPE messageType;
+    ULONG replySize = 0;
     KIRQL oldIrql;
 
     UNREFERENCED_PARAMETER(PortCookie);
 
     *ReturnOutputBufferLength = 0;
 
-    //
-    // Validate the input buffer. At minimum, we need an RS_MESSAGE_HEADER
-    // to determine the message type.
-    //
-    if (InputBuffer == NULL || InputBufferLength < sizeof(RS_MESSAGE_HEADER)) {
+    if (InputBuffer == NULL ||
+        InputBufferLength < sizeof(RS_MESSAGE_HEADER) ||
+        InputBufferLength > RS_MAX_REQUEST_SIZE) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    requestHeader = (PRS_MESSAGE_HEADER)InputBuffer;
+    //
+    // ---- 1. Capture the request ----
+    //
+    request = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, InputBufferLength, RS_POOL_TAG);
+    if (request == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    __try {
+        if (ExGetPreviousMode() != KernelMode) {
+            ProbeForRead(InputBuffer, InputBufferLength, sizeof(UCHAR));
+        }
+        RtlCopyMemory(request, InputBuffer, InputBufferLength);
+    } __except (RsUserBufferExceptionFilter(GetExceptionCode())) {
+        status = GetExceptionCode();
+    }
+
+    if (!NT_SUCCESS(status)) {
+        goto Exit;
+    }
+
+    //
+    // From here on only the kernel copy is read.
+    //
+    requestHeader = (PRS_MESSAGE_HEADER)request;
+    messageType = requestHeader->MessageType;
 
     //
     // Validate that the claimed MessageSize doesn't exceed the actual
-    // input buffer size. This prevents a malicious client from claiming
-    // a large MessageSize that could cause confusion in future processing
-    // that relies on the header's size field for bounds calculations.
+    // input size. This prevents a client from claiming a large
+    // MessageSize that later processing might rely on for bounds.
     //
     if (requestHeader->MessageSize > InputBufferLength) {
-        return STATUS_INVALID_PARAMETER;
+        status = STATUS_INVALID_PARAMETER;
+        goto Exit;
     }
 
-    switch (requestHeader->MessageType) {
+    status = RsGetReplySize(messageType, &replySize);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("RansomShield: Unknown message type %d\n", (int)messageType);
+        goto Exit;
+    }
+
+    if (OutputBuffer == NULL || OutputBufferLength < replySize) {
+        *ReturnOutputBufferLength = replySize;
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto Exit;
+    }
+
+    //
+    // ---- 2. Build the reply in kernel memory ----
+    //
+    // Non-paged because some handlers fill it while holding g_ContextLock;
+    // zero-filled by ExAllocatePool2, so unused fields and slots are 0.
+    //
+    reply = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, replySize, RS_POOL_TAG);
+    if (reply == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    //
+    // Header-only requests need nothing beyond the header checked above.
+    // Requests with a payload check their own size right before the payload
+    // is read.
+    //
+    switch (messageType) {
 
     //
     // ---- QUERY BLOCKED PIDS ----
     //
     case RsQueryBlockedPids:
     {
-        PRS_REPLY_BLOCKED_PIDS reply;
-        ULONG requiredSize;
+        PRS_REPLY_BLOCKED_PIDS r = (PRS_REPLY_BLOCKED_PIDS)reply;
+
+        RsFillReplyHeader(&r->Header, RsReplyBlockedPids, replySize);
 
         //
-        // Calculate the required output buffer size.
-        // We always allocate space for RS_MAX_REPORT_BLOCKED entries
-        // regardless of how many are actually blocked. This simplifies
-        // the protocol (fixed-size reply).
+        // Fixed-size reply with room for RS_MAX_REPORT_BLOCKED entries.
+        // RsGetBlockedPids fills it under g_ContextLock, which is why the
+        // reply must be non-paged kernel memory.
         //
-        requiredSize = sizeof(RS_REPLY_BLOCKED_PIDS);
+        RsGetBlockedPids(r->Entries, RS_MAX_REPORT_BLOCKED, &r->Count);
 
-        if (OutputBuffer == NULL || OutputBufferLength < requiredSize) {
-            *ReturnOutputBufferLength = requiredSize;
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-
-        reply = (PRS_REPLY_BLOCKED_PIDS)OutputBuffer;
-        RtlZeroMemory(reply, requiredSize);
-
-        //
-        // Fill in the reply header.
-        //
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType     = RsReplyBlockedPids;
-        reply->Header.MessageSize     = requiredSize;
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-
-        //
-        // Get the list of blocked PIDs. RsGetBlockedPids acquires
-        // and releases g_ContextLock internally.
-        //
-        RsGetBlockedPids(reply->Entries, RS_MAX_REPORT_BLOCKED, &reply->Count);
-
-        *ReturnOutputBufferLength = requiredSize;
-
-        DbgPrint("RansomShield: QueryBlockedPids - returning %lu entries\n",
-                 reply->Count);
-
-        status = STATUS_SUCCESS;
+        DbgPrint("RansomShield: QueryBlockedPids - returning %lu entries\n", r->Count);
         break;
     }
 
@@ -662,353 +772,206 @@ RsMessageNotifyCallback(
     //
     case RsRequestUnblockPid:
     {
-        PRS_REQUEST_UNBLOCK_PID request;
-        PRS_REPLY_UNBLOCK_PID reply;
-        ULONG requiredSize;
+        PRS_REQUEST_UNBLOCK_PID q = (PRS_REQUEST_UNBLOCK_PID)request;
+        PRS_REPLY_UNBLOCK_PID r = (PRS_REPLY_UNBLOCK_PID)reply;
 
-        //
-        // Validate the request has the expected payload.
-        //
         if (InputBufferLength < sizeof(RS_REQUEST_UNBLOCK_PID)) {
-            return STATUS_INVALID_PARAMETER;
+            status = STATUS_INVALID_PARAMETER;
+            goto Exit;
         }
 
-        request = (PRS_REQUEST_UNBLOCK_PID)InputBuffer;
-
-        requiredSize = sizeof(RS_REPLY_UNBLOCK_PID);
-
-        if (OutputBuffer == NULL || OutputBufferLength < requiredSize) {
-            *ReturnOutputBufferLength = requiredSize;
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-
-        reply = (PRS_REPLY_UNBLOCK_PID)OutputBuffer;
-        RtlZeroMemory(reply, requiredSize);
-
-        //
-        // Fill in the reply header.
-        //
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType     = RsReplyUnblockPid;
-        reply->Header.MessageSize     = requiredSize;
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->ProcessId = request->ProcessId;
-
-        //
-        // Unblock the PID. RsUnblockProcess removes the process context
-        // entirely, which also clears the IsBlocked flag.
         //
         // SECURITY NOTE: The communication port already restricts
         // connections to administrators (via the security descriptor).
         // So only admin-level processes can unblock PIDs. This prevents
         // ransomware from unblocking itself.
         //
-        RsUnblockProcess(request->ProcessId);
+        // RsUnblockProcess removes the process context entirely, which
+        // also clears the IsBlocked flag.
+        //
+        RsUnblockProcess(q->ProcessId);
 
-        reply->Status = STATUS_SUCCESS;
+        RsFillReplyHeader(&r->Header, RsReplyUnblockPid, replySize);
+        r->ProcessId = q->ProcessId;
+        r->Status = STATUS_SUCCESS;
 
-        *ReturnOutputBufferLength = requiredSize;
-
-        DbgPrint("RansomShield: PID %lu unblocked by user-mode service\n",
-                 request->ProcessId);
-
-        status = STATUS_SUCCESS;
+        DbgPrint("RansomShield: PID %lu unblocked by user-mode service\n", q->ProcessId);
         break;
     }
 
+    //
     // ---- QUERY CURRENT CONFIG ----
+    //
     case RsQueryConfig:
     {
-        PRS_REPLY_CONFIG reply;
+        PRS_REPLY_CONFIG r = (PRS_REPLY_CONFIG)reply;
 
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_CONFIG)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_CONFIG);
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-
-        reply = (PRS_REPLY_CONFIG)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_CONFIG));
+        RsFillReplyHeader(&r->Header, RsQueryConfig, replySize);
 
         KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        reply->FileCountThreshold    = g_FileCountThreshold;
-        reply->TimeWindowSeconds     = g_TimeWindowSeconds;
-        reply->MonitoringEnabled     = g_MonitoringEnabled;
+        r->FileCountThreshold = g_FileCountThreshold;
+        r->TimeWindowSeconds  = g_TimeWindowSeconds;
+        r->MonitoringEnabled  = g_MonitoringEnabled;
         KeReleaseSpinLock(&g_ContextLock, oldIrql);
 
-        reply->Header.MessageType    = RsQueryConfig;
-        reply->Header.MessageSize    = sizeof(RS_REPLY_CONFIG);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-
-        RsGetPidCounts(&reply->TrackedPidCount, &reply->BlockedPidCount);
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_CONFIG);
-        status = STATUS_SUCCESS;
+        RsGetPidCounts(&r->TrackedPidCount, &r->BlockedPidCount);
         break;
     }
 
+    //
     // ---- QUERY CURRENT ALLOWLIST ----
+    //
     case RsQueryAllowlist:
     {
-        PRS_REPLY_ALLOWLIST reply;
-        ULONG dynCount;
-        ULONG i;
+        PRS_REPLY_ALLOWLIST r = (PRS_REPLY_ALLOWLIST)reply;
 
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_ALLOWLIST)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_ALLOWLIST);
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-
-        reply = (PRS_REPLY_ALLOWLIST)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_ALLOWLIST));
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        dynCount = g_DynamicAllowlistCount;
-        for (i = 0; i < dynCount && i < RS_MAX_ALLOWLIST_ENTRIES; i++) {
-            RtlCopyMemory(reply->Entries[i], g_DynamicAllowlist[i],
-                          RS_MAX_ALLOWLIST_NAME_LEN * sizeof(WCHAR));
-        }
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType     = RsQueryAllowlist;
-        reply->Header.MessageSize     = sizeof(RS_REPLY_ALLOWLIST);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->Count                  = dynCount;
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_ALLOWLIST);
-        status = STATUS_SUCCESS;
+        RsFillReplyHeader(&r->Header, RsQueryAllowlist, replySize);
+        RsSnapshotDynamicAllowlist(r->Entries, RS_MAX_ALLOWLIST_ENTRIES, &r->Count);
         break;
     }
 
-    // ---- PAUSE MONITORING ----
+    //
+    // ---- PAUSE / RESUME MONITORING ----
+    //
     case RsRequestPause:
-    {
-        PRS_REPLY_GENERIC reply;
-
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        g_MonitoringEnabled = FALSE;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply = (PRS_REPLY_GENERIC)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType    = RsRequestPause;
-        reply->Header.MessageSize    = sizeof(RS_REPLY_GENERIC);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->Status = STATUS_SUCCESS;
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-        DbgPrint("RansomShield: Monitoring paused\n");
-        status = STATUS_SUCCESS;
-        break;
-    }
-
-    // ---- RESUME MONITORING ----
     case RsRequestResume:
     {
-        PRS_REPLY_GENERIC reply;
+        PRS_REPLY_GENERIC r = (PRS_REPLY_GENERIC)reply;
+        BOOLEAN enable = (messageType == RsRequestResume) ? TRUE : FALSE;
 
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-            return STATUS_BUFFER_TOO_SMALL;
+        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        g_MonitoringEnabled = enable;
+        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+        RsFillReplyHeader(&r->Header, messageType, replySize);
+        r->Status = STATUS_SUCCESS;
+
+        if (enable) {
+            DbgPrint("RansomShield: Monitoring resumed\n");
+        } else {
+            DbgPrint("RansomShield: Monitoring paused\n");
         }
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        g_MonitoringEnabled = TRUE;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply = (PRS_REPLY_GENERIC)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType    = RsRequestResume;
-        reply->Header.MessageSize    = sizeof(RS_REPLY_GENERIC);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->Status = STATUS_SUCCESS;
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-        DbgPrint("RansomShield: Monitoring resumed\n");
-        status = STATUS_SUCCESS;
         break;
     }
 
+    //
     // ---- UPDATE CONFIG ----
+    //
     case RsUpdateConfig:
     {
-        PRS_REQUEST_UPDATE_CONFIG request;
-        PRS_REPLY_GENERIC reply;
+        PRS_REQUEST_UPDATE_CONFIG q = (PRS_REQUEST_UPDATE_CONFIG)request;
+        PRS_REPLY_GENERIC r = (PRS_REPLY_GENERIC)reply;
 
         if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_CONFIG)) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-            return STATUS_BUFFER_TOO_SMALL;
+            status = STATUS_INVALID_PARAMETER;
+            goto Exit;
         }
 
-        request = (PRS_REQUEST_UPDATE_CONFIG)InputBuffer;
-        RsApplyConfig(request->FileCountThreshold,
-                       request->TimeWindowSeconds,
-                       request->MonitoringEnabled);
+        //
+        // RsApplyConfig rejects out-of-range values without changing
+        // anything; the failure is returned to the client.
+        //
+        status = RsApplyConfig(q->FileCountThreshold,
+                               q->TimeWindowSeconds,
+                               q->MonitoringEnabled);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("RansomShield: UpdateConfig rejected (threshold=%lu, window=%lu)\n",
+                     q->FileCountThreshold, q->TimeWindowSeconds);
+            goto Exit;
+        }
 
-        reply = (PRS_REPLY_GENERIC)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType     = RsUpdateConfig;
-        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->Status = STATUS_SUCCESS;
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-        status = STATUS_SUCCESS;
+        RsFillReplyHeader(&r->Header, RsUpdateConfig, replySize);
+        r->Status = STATUS_SUCCESS;
         break;
     }
 
+    //
     // ---- CLEAR ALLOWLIST ----
+    //
     case RsClearAllowlist:
     {
-        PRS_REPLY_GENERIC reply;
-
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-            return STATUS_BUFFER_TOO_SMALL;
-        }
+        PRS_REPLY_GENERIC r = (PRS_REPLY_GENERIC)reply;
 
         RsClearDynamicAllowlist();
 
-        reply = (PRS_REPLY_GENERIC)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType     = RsClearAllowlist;
-        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->Status = STATUS_SUCCESS;
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-        status = STATUS_SUCCESS;
+        RsFillReplyHeader(&r->Header, RsClearAllowlist, replySize);
+        r->Status = STATUS_SUCCESS;
         break;
     }
 
-    // ---- UPDATE ALLOWLIST (CHUNK) ----
+    //
+    // ---- UPDATE ALLOWLIST (CHUNK): append ----
+    //
     case RsUpdateAllowlistChunk:
     {
-        PRS_REQUEST_UPDATE_ALLOWLIST_CHUNK request;
-        PRS_REPLY_GENERIC reply;
-        ULONG i;
+        PRS_REQUEST_UPDATE_ALLOWLIST_CHUNK q = (PRS_REQUEST_UPDATE_ALLOWLIST_CHUNK)request;
+        PRS_REPLY_GENERIC r = (PRS_REPLY_GENERIC)reply;
 
-        if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_ALLOWLIST_CHUNK)) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-
-        request = (PRS_REQUEST_UPDATE_ALLOWLIST_CHUNK)InputBuffer;
-
-        if (request->EntryCount > RS_MAX_ALLOWLIST_CHUNK) {
-            return STATUS_INVALID_PARAMETER;
+        //
+        // q is the kernel copy, so EntryCount cannot change between this
+        // check and its use.
+        //
+        if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_ALLOWLIST_CHUNK) ||
+            q->EntryCount > RS_MAX_ALLOWLIST_CHUNK) {
+            status = STATUS_INVALID_PARAMETER;
+            goto Exit;
         }
 
-        for (i = 0; i < request->EntryCount; i++) {
-            ULONG len = 0;
-            PWCHAR p = request->Entries[i];
-            while (len < RS_MAX_ALLOWLIST_NAME_LEN - 1 && p[len] != L'\0') { len++; }
-            RsAddDynamicAllowlistEntry(request->Entries[i], len);
-        }
+        RsUpdateDynamicAllowlist(q->Entries, q->EntryCount, FALSE);
 
-        reply = (PRS_REPLY_GENERIC)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType     = RsUpdateAllowlistChunk;
-        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->Status = STATUS_SUCCESS;
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-        status = STATUS_SUCCESS;
+        RsFillReplyHeader(&r->Header, RsUpdateAllowlistChunk, replySize);
+        r->Status = STATUS_SUCCESS;
         break;
     }
 
-    // ---- UPDATE ALLOWLIST (FULL) ----
+    //
+    // ---- UPDATE ALLOWLIST (FULL): replace ----
+    //
     case RsUpdateAllowlistFull:
     {
-        PRS_REQUEST_UPDATE_ALLOWLIST_FULL request;
-        PRS_REPLY_GENERIC reply;
-        ULONG i;
+        PRS_REQUEST_UPDATE_ALLOWLIST_FULL q = (PRS_REQUEST_UPDATE_ALLOWLIST_FULL)request;
+        PRS_REPLY_GENERIC r = (PRS_REPLY_GENERIC)reply;
 
-        if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_ALLOWLIST_FULL)) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        if (OutputBuffer == NULL || OutputBufferLength < sizeof(RS_REPLY_GENERIC)) {
-            *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-            return STATUS_BUFFER_TOO_SMALL;
+        if (InputBufferLength < sizeof(RS_REQUEST_UPDATE_ALLOWLIST_FULL) ||
+            q->EntryCount > RS_MAX_ALLOWLIST_ENTRIES) {
+            status = STATUS_INVALID_PARAMETER;
+            goto Exit;
         }
 
-        request = (PRS_REQUEST_UPDATE_ALLOWLIST_FULL)InputBuffer;
+        RsUpdateDynamicAllowlist(q->Entries, q->EntryCount, TRUE);
 
-        if (request->EntryCount > RS_MAX_ALLOWLIST_ENTRIES) {
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        for (i = 0; i < request->EntryCount; i++) {
-            ULONG len = 0;
-            PWCHAR p = request->Entries[i];
-            while (len < RS_MAX_ALLOWLIST_NAME_LEN - 1 && p[len] != L'\0') { len++; }
-            RsAddDynamicAllowlistEntry(request->Entries[i], len);
-        }
-
-        reply = (PRS_REPLY_GENERIC)OutputBuffer;
-        RtlZeroMemory(reply, sizeof(RS_REPLY_GENERIC));
-
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-        reply->Header.SequenceNumber = g_MessageSequence++;
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
-
-        reply->Header.MessageType     = RsUpdateAllowlistFull;
-        reply->Header.MessageSize     = sizeof(RS_REPLY_GENERIC);
-        reply->Header.ProtocolVersion = RS_PROTOCOL_VERSION;
-        reply->Status = STATUS_SUCCESS;
-
-        *ReturnOutputBufferLength = sizeof(RS_REPLY_GENERIC);
-        status = STATUS_SUCCESS;
+        RsFillReplyHeader(&r->Header, RsUpdateAllowlistFull, replySize);
+        r->Status = STATUS_SUCCESS;
         break;
     }
 
     default:
-        DbgPrint("RansomShield: Unknown message type %d\n",
-                 requestHeader->MessageType);
+        //
+        // RsGetReplySize already rejected every other type.
+        //
         status = STATUS_INVALID_PARAMETER;
-        break;
+        goto Exit;
     }
+
+    //
+    // ---- 3. Copy the reply out to the client ----
+    //
+    __try {
+        if (ExGetPreviousMode() != KernelMode) {
+            ProbeForWrite(OutputBuffer, replySize, sizeof(UCHAR));
+        }
+        RtlCopyMemory(OutputBuffer, reply, replySize);
+        *ReturnOutputBufferLength = replySize;
+    } __except (RsUserBufferExceptionFilter(GetExceptionCode())) {
+        status = GetExceptionCode();
+    }
+
+Exit:
+    if (reply != NULL) {
+        ExFreePoolWithTag(reply, RS_POOL_TAG);
+    }
+
+    ExFreePoolWithTag(request, RS_POOL_TAG);
 
     return status;
 }

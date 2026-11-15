@@ -84,6 +84,29 @@ CommManager::~CommManager()
 
 HRESULT CommManager::Connect()
 {
+    //
+    // Reap what is left of a dropped connection before opening a new one.
+    // When the driver goes away (unload, reload) or a send fails, the
+    // listener thread exits or is about to, but m_hPort still holds the old
+    // handle and the thread has not been joined. Reconnecting on top of that
+    // would leak the handle, and a listener still draining the old handle
+    // could mark the NEW connection as disconnected.
+    //
+    bool reapStale = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        if (m_connected && m_hPort != INVALID_HANDLE_VALUE) {
+            return S_OK;   // Already connected.
+        }
+
+        reapStale = (m_hPort != INVALID_HANDLE_VALUE);
+    }
+
+    if (reapStale || m_listenerThread.joinable()) {
+        StopListener();   // stops and joins the listener, closes the stale handle
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
 
     //
@@ -301,7 +324,19 @@ HRESULT CommManager::StartListener(NotificationCallback callback)
         if (m_listenerRunning) {
             return S_OK;  // Already running
         }
+    }
 
+    //
+    // A previous listener that ended on its own (port closed) has finished
+    // but has not been joined. Join it before starting a new one: assigning
+    // to a joinable std::thread calls std::terminate().
+    //
+    if (m_listenerThread.joinable()) {
+        m_listenerThread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
         m_callback = callback;
         m_listenerRunning = true;
     }
@@ -480,6 +515,15 @@ void CommManager::ListenerThreadProc()
     }
 
     delete[] buffer;
+
+    //
+    // Clear the flag on every exit path, including the port closing
+    // underneath us (driver unload or reload, health-check disconnect).
+    // If it stayed set, the next StartListener() would see a "running"
+    // listener and start nothing, and alerts would stop after a reconnect.
+    //
+    m_listenerRunning.store(false);
+
     wprintf(L"RansomShield: Listener thread exiting.\n");
 }
 

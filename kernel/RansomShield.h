@@ -92,8 +92,11 @@ IRQL Considerations:
 #define RS_TIME_WINDOW_TICKS            ((LONGLONG)RS_TIME_WINDOW_SECONDS * 10000000)
 
 //
-// Maximum number of process contexts we track simultaneously. This bounds
-// memory usage in non-paged pool.
+// Maximum number of process contexts tracked at once. This bounds non-paged
+// pool use (~2.6 KB per context). Contexts are normally released when their
+// process exits (RsProcessNotifyRoutine in RsContext.c); this cap is the
+// backstop, enforced in RsRecordOperation by evicting the least-recently-
+// active unblocked context.
 //
 #define RS_MAX_TRACKED_PIDS             1024
 
@@ -139,6 +142,17 @@ typedef struct _RS_OPERATION_ENTRY {
 #define RS_MAX_OPERATIONS_PER_PID       256
 
 //
+// The configurable threshold must be reachable inside the ring buffer, and
+// the compile-time defaults must sit inside the accepted ranges
+// (RS_MIN/MAX_* in SharedDefs.h).
+//
+C_ASSERT(RS_MAX_FILE_COUNT_THRESHOLD <= RS_MAX_OPERATIONS_PER_PID);
+C_ASSERT(RS_DEFAULT_FILE_COUNT_THRESHOLD >= RS_MIN_FILE_COUNT_THRESHOLD &&
+         RS_DEFAULT_FILE_COUNT_THRESHOLD <= RS_MAX_FILE_COUNT_THRESHOLD);
+C_ASSERT(RS_DEFAULT_TIME_WINDOW_SECONDS >= RS_MIN_TIME_WINDOW_SECONDS &&
+         RS_DEFAULT_TIME_WINDOW_SECONDS <= RS_MAX_TIME_WINDOW_SECONDS);
+
+//
 // RS_PROCESS_CONTEXT - Per-PID tracking structure. This is the core
 // heuristic data structure. All instances are stored in a global
 // hash table protected by a spinlock.
@@ -147,8 +161,9 @@ typedef struct _RS_OPERATION_ENTRY {
 //   - Allocated via ExAllocatePool2(NonPagedPoolNx, ...) when a new
 //     PID is first seen. NonPagedPoolNx is required because we access
 //     this under a spinlock (IRQL raised to DISPATCH_LEVEL).
-//   - Freed when the process exits (we detect this via a timer-based
-//     garbage collection sweep) or during driver unload.
+//   - Freed when the process exits (RsProcessNotifyRoutine), when it is
+//     evicted to stay within RS_MAX_TRACKED_PIDS, when user mode unblocks
+//     the PID, or during driver unload.
 //
 // SYNCHRONIZATION:
 //   - The global hash table lock (g_ContextLock) protects the table
@@ -163,6 +178,13 @@ typedef struct _RS_PROCESS_CONTEXT {
     // Hash table link. We use separate chaining for collision resolution.
     //
     LIST_ENTRY      Link;
+
+    //
+    // Position in the global LRU list (g_LruList in RsContext.c), oldest
+    // first. Moved to the tail on every recorded operation; the head is the
+    // eviction candidate once RS_MAX_TRACKED_PIDS is reached.
+    //
+    LIST_ENTRY      LruLink;
 
     //
     // The process ID this context tracks. We use the PID from
@@ -202,6 +224,10 @@ typedef struct _RS_PROCESS_CONTEXT {
     // operations fall below the threshold. A user-mode service must
     // explicitly unblock the PID via the communication port. This
     // prevents ransomware from simply waiting out the window.
+    //
+    // The block lasts for the life of the process: when the process exits
+    // its context is removed, so a later process that reuses the PID
+    // starts clean instead of inheriting the block.
     //
     BOOLEAN         IsBlocked;
 
@@ -268,7 +294,9 @@ extern LONGLONG    g_TimeWindowTicks;
 extern BOOLEAN     g_MonitoringEnabled;
 
 // Dynamic allowlist (user-mode push, in addition to the static built-in list).
-// Array of null-terminated wide strings, protected by g_ContextLock.
+// Array of null-terminated wide strings, protected by a push lock private to
+// RsContext.c (not g_ContextLock); access it only through the Rs*Allowlist
+// routines.
 extern WCHAR       g_DynamicAllowlist[RS_MAX_ALLOWLIST_ENTRIES][RS_MAX_ALLOWLIST_NAME_LEN];
 extern ULONG       g_DynamicAllowlistCount;
 
@@ -332,6 +360,21 @@ RsDestroyContextTracking(
     VOID
     );
 
+//
+// Process exit tracking (PsSetCreateProcessNotifyRoutineEx). Start after
+// RsInitializeContextTracking; stop after FltUnregisterFilter and before
+// RsDestroyContextTracking.
+//
+NTSTATUS
+RsStartProcessLifecycleTracking(
+    VOID
+    );
+
+VOID
+RsStopProcessLifecycleTracking(
+    VOID
+    );
+
 NTSTATUS
 RsRecordOperation(
     _In_ ULONG ProcessId,
@@ -368,27 +411,55 @@ RsGetPidCounts(
     _Out_ PULONG BlockedCount
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 RsIsProcessAllowlisted(
     _In_ PUNICODE_STRING ProcessImageName
     );
 
-VOID
+//
+// Validates and applies a configuration update. 0 leaves a value unchanged;
+// any other value outside RS_MIN/MAX_* (SharedDefs.h) is rejected with
+// STATUS_INVALID_PARAMETER and nothing is changed.
+//
+NTSTATUS
 RsApplyConfig(
     _In_ ULONG FileCountThreshold,
     _In_ ULONG TimeWindowSeconds,
     _In_ BOOLEAN MonitoringEnabled
     );
 
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 RsClearDynamicAllowlist(
     VOID
     );
 
+//
+// Adds entries to the dynamic allowlist (Replace = FALSE) or replaces it
+// (Replace = TRUE). Entries is EntryCount fixed-size slots, as laid out in
+// the allowlist request messages. Entries must be kernel memory (a captured
+// copy, never a user buffer).
+//
+_IRQL_requires_max_(APC_LEVEL)
 VOID
-RsAddDynamicAllowlistEntry(
-    _In_reads_(EntryLen) PWCHAR Entry,
-    _In_ ULONG EntryLen
+RsUpdateDynamicAllowlist(
+    _In_reads_(EntryCount) WCHAR (*Entries)[RS_MAX_ALLOWLIST_NAME_LEN],
+    _In_ ULONG EntryCount,
+    _In_ BOOLEAN Replace
+    );
+
+//
+// Copies the dynamic allowlist into Entries (MaxEntries slots);
+// *CountReturned receives how many slots were filled. Entries must be
+// kernel memory.
+//
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+RsSnapshotDynamicAllowlist(
+    _Out_writes_to_(MaxEntries, *CountReturned) WCHAR (*Entries)[RS_MAX_ALLOWLIST_NAME_LEN],
+    _In_ ULONG MaxEntries,
+    _Out_ PULONG CountReturned
     );
 
 //

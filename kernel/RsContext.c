@@ -76,6 +76,13 @@ LIST_ENTRY  g_ContextHashTable[RS_HASH_TABLE_SIZE];
 KSPIN_LOCK  g_ContextLock;
 
 //
+// LRU order of all tracked contexts (RS_PROCESS_CONTEXT.LruLink), oldest
+// first. Protected by g_ContextLock. The head is the eviction candidate when
+// RS_MAX_TRACKED_PIDS is reached.
+//
+static LIST_ENTRY g_LruList;
+
+//
 // Current count of tracked PIDs. Protected by g_ContextLock.
 // Used to enforce RS_MAX_TRACKED_PIDS limit and for telemetry.
 //
@@ -98,11 +105,31 @@ BOOLEAN  g_MonitoringEnabled  = RS_DEFAULT_MONITORING_ENABLED;
 
 //
 // Dynamic allowlist populated at runtime via user-mode push messages.
-// Entries are null-terminated wide strings.  Protected by g_ContextLock.
+// Entries are null-terminated wide strings. Protected by g_AllowlistLock.
 // Resides in the driver image's .data section — always non-paged.
 //
 WCHAR g_DynamicAllowlist[RS_MAX_ALLOWLIST_ENTRIES][RS_MAX_ALLOWLIST_NAME_LEN];
 ULONG g_DynamicAllowlistCount = 0;
+
+//
+// Push lock for the dynamic allowlist. A push lock rather than g_ContextLock
+// because lookups compare against the process image name returned by
+// SeLocateProcessImageName, which lives in PAGED pool: touching it is only
+// legal at IRQL <= APC_LEVEL, and holding a spinlock raises to DISPATCH_LEVEL.
+// It also keeps allowlist lookups off the per-PID spinlock.
+//
+static EX_PUSH_LOCK g_AllowlistLock;
+
+//
+// Set by RsInitializeContextTracking, cleared by RsDestroyContextTracking, so
+// teardown is safe to run even if initialization never happened.
+//
+static BOOLEAN g_ContextTrackingInitialized = FALSE;
+
+//
+// TRUE while RsProcessNotifyRoutine is registered.
+//
+static BOOLEAN g_ProcessNotifyRegistered = FALSE;
 
 //
 // Static built-in allowlist: UNICODE_STRINGs pointing into .rdata literals.
@@ -157,6 +184,20 @@ RsCopyImageNameToContext(
     _In_opt_ PUNICODE_STRING SourceName
     );
 
+static
+PRS_PROCESS_CONTEXT
+RsEvictLeastRecentContext(
+    VOID
+    );
+
+static
+VOID
+RsProcessNotifyRoutine(
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    );
+
 // ============================================================================
 // INITIALIZATION / TEARDOWN
 // ============================================================================
@@ -198,6 +239,9 @@ RsInitializeContextTracking(
         InitializeListHead(&g_ContextHashTable[i]);
     }
 
+    InitializeListHead(&g_LruList);
+    FltInitializePushLock(&g_AllowlistLock);
+
     //
     // Initialize the allowlist. We point each UNICODE_STRING to the
     // corresponding static string literal. These are in the driver's
@@ -212,23 +256,24 @@ RsInitializeContextTracking(
 
     g_TrackedPidCount = 0;
     g_MessageSequence = 0;
+    g_ContextTrackingInitialized = TRUE;
 
     return STATUS_SUCCESS;
 }
 
 /*++
 Routine Description:
-    Destroys all context tracking data. Must be called during
-    FilterUnloadCallback after all I/O has been drained.
+    Destroys all context tracking data.
 
-    IMPORTANT: This must be called when NO pre/post callbacks are
-    executing. The filter manager guarantees this because it waits
-    for all outstanding callbacks to complete before calling the
-    unload routine. Therefore, we don't need to acquire the spinlock
-    here — there should be no concurrent access.
+    IMPORTANT: Call this only when nothing can reach the table any more:
+    after FltUnregisterFilter has returned (it waits for every in-flight
+    pre/post-operation callback) and after RsStopProcessLifecycleTracking
+    (no more exit notifications). The filter manager does NOT drain
+    callbacks before calling the unload routine; FltUnregisterFilter is
+    what does. RsTeardown in RansomShield.c enforces this order.
 
-    However, for defensive programming, we still acquire the lock
-    to guard against programming errors.
+    The lock is still taken, defensively. Safe to call if
+    RsInitializeContextTracking never ran.
 --*/
 VOID
 RsDestroyContextTracking(
@@ -240,6 +285,10 @@ RsDestroyContextTracking(
     PLIST_ENTRY listHead;
     PLIST_ENTRY entry;
     PRS_PROCESS_CONTEXT context;
+
+    if (!g_ContextTrackingInitialized) {
+        return;
+    }
 
     KeAcquireSpinLock(&g_ContextLock, &oldIrql);
 
@@ -266,9 +315,16 @@ RsDestroyContextTracking(
         }
     }
 
+    //
+    // Every context was on the LRU list too; they are all freed now.
+    //
+    InitializeListHead(&g_LruList);
     g_TrackedPidCount = 0;
 
     KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+    FltDeletePushLock(&g_AllowlistLock);
+    g_ContextTrackingInitialized = FALSE;
 }
 
 // ============================================================================
@@ -446,6 +502,7 @@ RsCreateProcessContext(
     context->BlockedTimestamp = 0;
     context->LastActivityTime = 0;
     InitializeListHead(&context->Link);
+    InitializeListHead(&context->LruLink);
 
     //
     // Copy the image name into the context. We make a deep copy because
@@ -564,6 +621,7 @@ RsRecordOperation(
     PLIST_ENTRY bucketHead;
     PRS_PROCESS_CONTEXT context;
     PRS_PROCESS_CONTEXT newContext = NULL;
+    PRS_PROCESS_CONTEXT evictedContext = NULL;
     LONGLONG currentTime;
     ULONG recentCount;
 
@@ -622,10 +680,8 @@ RsRecordOperation(
     //
 
     //
-    // Check if we've reached the maximum number of tracked PIDs.
-    // If so, we need to evict the least recently active context.
-    // For simplicity, we allow a small overrun here and evict lazily.
-    // A production driver would implement LRU eviction.
+    // The RS_MAX_TRACKED_PIDS cap is enforced below, under the lock, when
+    // the new context is inserted.
     //
     newContext = RsCreateProcessContext(ProcessId, ProcessImageName);
     if (newContext == NULL) {
@@ -655,16 +711,35 @@ RsRecordOperation(
         }
     } else {
         //
-        // Our allocation wins. Insert the new context into the hash table.
+        // Our allocation wins. If the table is full, make room first by
+        // evicting the least-recently-active context that is NOT blocked
+        // (evicting a blocked one would lift its block). The evicted
+        // context is freed after the lock is released.
         //
+        if (g_TrackedPidCount >= RS_MAX_TRACKED_PIDS) {
+            evictedContext = RsEvictLeastRecentContext();
+
+            if (evictedContext == NULL) {
+                //
+                // Every tracked context is blocked. Do not track this PID:
+                // fail open, the same policy as an allocation failure.
+                //
+                KeReleaseSpinLock(&g_ContextLock, oldIrql);
+                ExFreePoolWithTag(newContext, RS_POOL_TAG);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+        }
+
         context = newContext;
 
         //
         // Insert at the HEAD of the bucket chain. InsertHeadList is O(1).
         // This is more cache-friendly than InsertTailList for frequently
-        // accessed entries (temporal locality).
+        // accessed entries (temporal locality). The context also joins the
+        // LRU list at the most-recent end.
         //
         InsertHeadList(bucketHead, &context->Link);
+        InsertTailList(&g_LruList, &context->LruLink);
         g_TrackedPidCount++;
     }
 
@@ -702,9 +777,12 @@ RecordAndEvaluate:
     }
 
     //
-    // Update last activity timestamp for LRU eviction.
+    // Update last activity timestamp and move this context to the
+    // most-recent end of the LRU list (O(1)).
     //
     context->LastActivityTime = currentTime;
+    RemoveEntryList(&context->LruLink);
+    InsertTailList(&g_LruList, &context->LruLink);
 
     //
     // ---- EVALUATE THRESHOLD ----
@@ -753,7 +831,10 @@ RecordAndEvaluate:
     //
     WCHAR localImageName[RS_MAX_IMAGE_NAME_LEN];
     LONGLONG localBlockedTimestamp = 0;
+    ULONG localWindowSeconds = 0;
     BOOLEAN localShouldNotify = FALSE;
+
+    localImageName[0] = L'\0';
 
     if (recentCount >= g_FileCountThreshold && !context->IsBlocked && g_MonitoringEnabled) {
         //
@@ -776,22 +857,23 @@ RecordAndEvaluate:
         //
         RtlCopyMemory(localImageName, context->ImageName, sizeof(localImageName));
         localBlockedTimestamp = context->BlockedTimestamp;
-
-        if (ProcessImageName != NULL) {
-            DbgPrint("RansomShield: PID %lu (%wZ) BLOCKED - %lu ops in %d sec window\n",
-                     ProcessId, ProcessImageName, recentCount, RS_TIME_WINDOW_SECONDS);
-        } else {
-            DbgPrint("RansomShield: PID %lu (unknown) BLOCKED - %lu ops in %d sec window\n",
-                     ProcessId, recentCount, RS_TIME_WINDOW_SECONDS);
-        }
+        localWindowSeconds = g_TimeWindowSeconds;
     }
 
     KeReleaseSpinLock(&g_ContextLock, oldIrql);
 
     //
-    // ---- SEND NOTIFICATION (at PASSIVE_LEVEL, no lock held) ----
-    // If we just blocked a PID, notify the user-mode service.
-    // FltSendMessage() can only be called at PASSIVE_LEVEL because
+    // Free a context evicted to make room (insert path above), now that
+    // the lock is released.
+    //
+    if (evictedContext != NULL) {
+        ExFreePoolWithTag(evictedContext, RS_POOL_TAG);
+    }
+
+    //
+    // ---- LOG AND NOTIFY (no lock held) ----
+    // If we just blocked a PID, log it and notify the user-mode service.
+    // FltSendMessage() must not be called with a spinlock held because
     // it may wait for the user-mode client to read the message.
     //
     // We use the locally-copied data, NOT the context pointer, because
@@ -799,6 +881,24 @@ RecordAndEvaluate:
     // KeReleaseSpinLock above and this point.
     //
     if (localShouldNotify) {
+        //
+        // Logged only now, outside the spinlock: at DISPATCH_LEVEL nothing
+        // pageable may be touched (the SeLocateProcessImageName buffer is
+        // paged pool) and Unicode format codes are not allowed. %ws is only
+        // legal at PASSIVE_LEVEL and pre-operation callbacks can run at
+        // APC_LEVEL, so the name is printed only when that is safe.
+        // localImageName is a stack copy.
+        //
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            DbgPrint("RansomShield: PID %lu (%ws) BLOCKED - %lu ops in %lu sec window\n",
+                     ProcessId,
+                     (localImageName[0] != L'\0') ? localImageName : L"unknown",
+                     recentCount, localWindowSeconds);
+        } else {
+            DbgPrint("RansomShield: PID %lu BLOCKED - %lu ops in %lu sec window\n",
+                     ProcessId, recentCount, localWindowSeconds);
+        }
+
         RsSendBlockNotification(
             ProcessId,
             localImageName,
@@ -894,9 +994,49 @@ RsPruneOldOperations(
 
 /*++
 Routine Description:
+    Unlinks the least-recently-active context that is not blocked, so a new
+    context can be inserted without exceeding RS_MAX_TRACKED_PIDS. Blocked
+    contexts are skipped: evicting one would lift its block.
+
+    Blocked contexts stop moving in the LRU list (RsRecordOperation returns
+    before the LRU update), so they collect at the head; the walk skips at
+    most the blocked ones.
+
+    IRQL: DISPATCH_LEVEL, caller holds g_ContextLock. The caller frees the
+          returned context after releasing the lock.
+
+Return Value:
+    The unlinked context, or NULL if every tracked context is blocked.
+--*/
+static
+PRS_PROCESS_CONTEXT
+RsEvictLeastRecentContext(
+    VOID
+    )
+{
+    PLIST_ENTRY entry;
+    PRS_PROCESS_CONTEXT candidate;
+
+    for (entry = g_LruList.Flink; entry != &g_LruList; entry = entry->Flink) {
+        candidate = CONTAINING_RECORD(entry, RS_PROCESS_CONTEXT, LruLink);
+
+        if (!candidate->IsBlocked) {
+            RemoveEntryList(&candidate->Link);
+            RemoveEntryList(&candidate->LruLink);
+            g_TrackedPidCount--;
+            return candidate;
+        }
+    }
+
+    return NULL;
+}
+
+/*++
+Routine Description:
     Removes a process context from the hash table and frees it.
-    Used when a process exits or when the user-mode service requests
-    an unblock (which also removes the tracking data).
+    Used when a process exits (RsProcessNotifyRoutine) or when the
+    user-mode service requests an unblock (which also removes the
+    tracking data).
 
     IRQL: Acquires g_ContextLock internally. Must be called at
           PASSIVE_LEVEL or APC_LEVEL.
@@ -916,17 +1056,20 @@ RsRemoveProcessContext(
 
     if (context != NULL) {
         //
-        // Remove from the hash table chain and free the memory.
-        // RemoveEntryList removes the entry from its list and
-        // reinitializes its Flink/Blink to point to itself.
+        // Unlink from the hash chain and the LRU list. The memory is
+        // freed after the lock is released to keep the critical section
+        // short.
         //
         RemoveEntryList(&context->Link);
+        RemoveEntryList(&context->LruLink);
         g_TrackedPidCount--;
-
-        ExFreePoolWithTag(context, RS_POOL_TAG);
     }
 
     KeReleaseSpinLock(&g_ContextLock, oldIrql);
+
+    if (context != NULL) {
+        ExFreePoolWithTag(context, RS_POOL_TAG);
+    }
 }
 
 /*++
@@ -1015,10 +1158,10 @@ Routine Description:
     Uses case-insensitive comparison because Windows file systems are
     case-insensitive by default.
 
-    IRQL: This function only reads from the g_Allowlist array which
-          is in the driver's non-paged .rdata section. Safe at any IRQL.
-          However, the ProcessImageName buffer must be accessible at the
-          caller's IRQL.
+    IRQL: <= APC_LEVEL. Takes the allowlist push lock (shared), and
+          ProcessImageName is normally the PAGED buffer returned by
+          SeLocateProcessImageName, so this must never be called with a
+          spinlock held.
 
     Parameters:
         ProcessImageName - Full path or filename of the process image.
@@ -1028,6 +1171,7 @@ Return Value:
     TRUE  - Process is allowlisted and should NOT be tracked/blocked.
     FALSE - Process is NOT allowlisted; should be tracked normally.
 --*/
+_IRQL_requires_max_(APC_LEVEL)
 BOOLEAN
 RsIsProcessAllowlisted(
     _In_ PUNICODE_STRING ProcessImageName
@@ -1072,25 +1216,26 @@ RsIsProcessAllowlisted(
     processFileName.MaximumLength = processFileName.Length;
 
     //
-    // Check the static (built-in) allowlist.
+    // Check the static (built-in) allowlist. No logging on a match: this
+    // runs on every write from an allowlisted process.
     //
     for (i = 0; i < RS_ALLOWLIST_COUNT; i++) {
         if (RtlEqualUnicodeString(&processFileName, &g_Allowlist[i], TRUE)) {
-            DbgPrint("RansomShield: PID allowlisted (static) - %wZ\n", &processFileName);
             return TRUE;
         }
     }
 
     //
-    // Check the dynamic (user-pushed) allowlist under the spinlock.
-    // Entries are non-paged globals so RtlEqualUnicodeString is safe at DISPATCH_LEVEL.
+    // Check the dynamic (user-pushed) allowlist under its push lock,
+    // shared. processFileName points into the paged image-name buffer;
+    // that is legal here because a push lock keeps the IRQL at or below
+    // APC_LEVEL (a spinlock would raise it to DISPATCH_LEVEL).
     //
     {
-        KIRQL oldIrql;
         BOOLEAN found = FALSE;
         ULONG dynCount;
 
-        KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+        FltAcquirePushLockShared(&g_AllowlistLock);
         dynCount = g_DynamicAllowlistCount;
         for (i = 0; i < dynCount; i++) {
             UNICODE_STRING dynEntry;
@@ -1100,22 +1245,31 @@ RsIsProcessAllowlisted(
                 break;
             }
         }
-        KeReleaseSpinLock(&g_ContextLock, oldIrql);
+        FltReleasePushLock(&g_AllowlistLock);
 
-        if (found) {
-            DbgPrint("RansomShield: PID allowlisted (dynamic) - %wZ\n", &processFileName);
-            return TRUE;
-        }
+        return found;
     }
-
-    return FALSE;
 }
 
 // ============================================================================
 // RUNTIME CONFIG AND DYNAMIC ALLOWLIST
 // ============================================================================
 
-VOID
+/*++
+Routine Description:
+    Validates and applies a configuration update from user mode.
+
+    0 leaves a value unchanged (protocol contract, SharedDefs.h). Any other
+    value must lie inside RS_MIN/MAX_FILE_COUNT_THRESHOLD and
+    RS_MIN/MAX_TIME_WINDOW_SECONDS; otherwise nothing is changed. In
+    particular, a threshold above the per-PID ring buffer capacity
+    (RS_MAX_OPERATIONS_PER_PID) could never be reached and would silently
+    turn blocking off.
+
+Return Value:
+    STATUS_SUCCESS, or STATUS_INVALID_PARAMETER for an out-of-range value.
+--*/
+NTSTATUS
 RsApplyConfig(
     _In_ ULONG FileCountThreshold,
     _In_ ULONG TimeWindowSeconds,
@@ -1123,63 +1277,137 @@ RsApplyConfig(
     )
 {
     KIRQL oldIrql;
+
+    if (FileCountThreshold != 0 &&
+        (FileCountThreshold < RS_MIN_FILE_COUNT_THRESHOLD ||
+         FileCountThreshold > RS_MAX_FILE_COUNT_THRESHOLD)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (TimeWindowSeconds != 0 &&
+        (TimeWindowSeconds < RS_MIN_TIME_WINDOW_SECONDS ||
+         TimeWindowSeconds > RS_MAX_TIME_WINDOW_SECONDS)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     KeAcquireSpinLock(&g_ContextLock, &oldIrql);
-    if (FileCountThreshold > 0) {
+    if (FileCountThreshold != 0) {
         g_FileCountThreshold = FileCountThreshold;
     }
-    if (TimeWindowSeconds > 0) {
+    if (TimeWindowSeconds != 0) {
         g_TimeWindowSeconds = TimeWindowSeconds;
         g_TimeWindowTicks   = (LONGLONG)TimeWindowSeconds * 10000000LL;
     }
-    g_MonitoringEnabled = MonitoringEnabled;
+    g_MonitoringEnabled = MonitoringEnabled ? TRUE : FALSE;
     KeReleaseSpinLock(&g_ContextLock, oldIrql);
 
     DbgPrint("RansomShield: RsApplyConfig: threshold=%lu window=%lu monitoring=%d\n",
              FileCountThreshold, TimeWindowSeconds, (int)MonitoringEnabled);
+
+    return STATUS_SUCCESS;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
 VOID
 RsClearDynamicAllowlist(
     VOID
     )
 {
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+    FltAcquirePushLockExclusive(&g_AllowlistLock);
     g_DynamicAllowlistCount = 0;
     RtlZeroMemory(g_DynamicAllowlist, sizeof(g_DynamicAllowlist));
-    KeReleaseSpinLock(&g_ContextLock, oldIrql);
+    FltReleasePushLock(&g_AllowlistLock);
 
     DbgPrint("RansomShield: Dynamic allowlist cleared\n");
 }
 
+/*++
+Routine Description:
+    Appends entries to the dynamic allowlist, or replaces it, under one
+    exclusive acquisition of the allowlist lock (so a replace is never seen
+    half-done).
+
+    Entries is EntryCount fixed-size slots, exactly as laid out in
+    RS_REQUEST_UPDATE_ALLOWLIST_CHUNK/FULL. It must be kernel memory: the
+    message handler passes its captured copy of the request, never the raw
+    user buffer. Each slot is read up to its terminator or one WCHAR short
+    of the slot, so every stored entry is terminated. Empty slots are
+    skipped; entries beyond RS_MAX_ALLOWLIST_ENTRIES are dropped.
+
+    IRQL: <= APC_LEVEL.
+--*/
+_IRQL_requires_max_(APC_LEVEL)
 VOID
-RsAddDynamicAllowlistEntry(
-    _In_reads_(EntryLen) PWCHAR Entry,
-    _In_ ULONG EntryLen
+RsUpdateDynamicAllowlist(
+    _In_reads_(EntryCount) WCHAR (*Entries)[RS_MAX_ALLOWLIST_NAME_LEN],
+    _In_ ULONG EntryCount,
+    _In_ BOOLEAN Replace
     )
 {
-    KIRQL oldIrql;
-    ULONG copyLen;
+    ULONG i;
 
-    if (Entry == NULL || EntryLen == 0) {
-        return;
+    FltAcquirePushLockExclusive(&g_AllowlistLock);
+
+    if (Replace) {
+        g_DynamicAllowlistCount = 0;
+        RtlZeroMemory(g_DynamicAllowlist, sizeof(g_DynamicAllowlist));
     }
 
-    KeAcquireSpinLock(&g_ContextLock, &oldIrql);
+    for (i = 0; i < EntryCount && g_DynamicAllowlistCount < RS_MAX_ALLOWLIST_ENTRIES; i++) {
+        ULONG len = 0;
 
-    if (g_DynamicAllowlistCount < RS_MAX_ALLOWLIST_ENTRIES) {
-        copyLen = EntryLen < (RS_MAX_ALLOWLIST_NAME_LEN - 1)
-                  ? EntryLen
-                  : (RS_MAX_ALLOWLIST_NAME_LEN - 1);
+        while (len < RS_MAX_ALLOWLIST_NAME_LEN - 1 && Entries[i][len] != L'\0') {
+            len++;
+        }
 
-        RtlCopyMemory(g_DynamicAllowlist[g_DynamicAllowlistCount],
-                      Entry,
-                      copyLen * sizeof(WCHAR));
-        g_DynamicAllowlist[g_DynamicAllowlistCount][copyLen] = L'\0';
+        if (len == 0) {
+            continue;
+        }
+
+        RtlCopyMemory(g_DynamicAllowlist[g_DynamicAllowlistCount], Entries[i], len * sizeof(WCHAR));
+        g_DynamicAllowlist[g_DynamicAllowlistCount][len] = L'\0';
         g_DynamicAllowlistCount++;
     }
 
-    KeReleaseSpinLock(&g_ContextLock, oldIrql);
+    FltReleasePushLock(&g_AllowlistLock);
+}
+
+/*++
+Routine Description:
+    Copies the dynamic allowlist into a caller buffer of MaxEntries slots.
+    The buffer must be kernel memory (the message handler's reply buffer);
+    the copy to the client happens later, with no lock held.
+
+    IRQL: <= APC_LEVEL.
+--*/
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+RsSnapshotDynamicAllowlist(
+    _Out_writes_to_(MaxEntries, *CountReturned) WCHAR (*Entries)[RS_MAX_ALLOWLIST_NAME_LEN],
+    _In_ ULONG MaxEntries,
+    _Out_ PULONG CountReturned
+    )
+{
+    ULONG count;
+    ULONG i;
+
+    FltAcquirePushLockShared(&g_AllowlistLock);
+
+    count = g_DynamicAllowlistCount;
+    if (count > MaxEntries) {
+        count = MaxEntries;
+    }
+    if (count > RS_MAX_ALLOWLIST_ENTRIES) {
+        count = RS_MAX_ALLOWLIST_ENTRIES;
+    }
+
+    for (i = 0; i < count; i++) {
+        RtlCopyMemory(Entries[i], g_DynamicAllowlist[i], sizeof(g_DynamicAllowlist[i]));
+    }
+
+    FltReleasePushLock(&g_AllowlistLock);
+
+    *CountReturned = count;
 }
 
 VOID
@@ -1210,4 +1438,98 @@ RsGetPidCounts(
     *BlockedCount = blocked;
 
     KeReleaseSpinLock(&g_ContextLock, oldIrql);
+}
+
+// ============================================================================
+// PROCESS LIFECYCLE
+// ============================================================================
+
+/*++
+Routine Description:
+    Process create/exit notification (PsSetCreateProcessNotifyRoutineEx).
+
+    On exit, the process's tracking context is removed so that:
+      - non-paged pool use follows the live process population instead of
+        growing with every process that ever wrote a file, and
+      - a later process that reuses the PID starts with a clean context
+        instead of inheriting a sticky block. Windows reuses a PID only
+        after the process object is gone, which is after this
+        notification, so the removal always happens first.
+
+    Contexts are still created lazily, on the first monitored operation
+    (RsRecordOperation), so process creation needs no work here.
+
+    IRQL: PASSIVE_LEVEL, normal kernel APCs disabled.
+--*/
+static
+VOID
+RsProcessNotifyRoutine(
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    )
+{
+    UNREFERENCED_PARAMETER(Process);
+
+    if (CreateInfo != NULL) {
+        return;
+    }
+
+    RsRemoveProcessContext(HandleToULong(ProcessId));
+}
+
+/*++
+Routine Description:
+    Registers RsProcessNotifyRoutine. Call after RsInitializeContextTracking.
+
+    PsSetCreateProcessNotifyRoutineEx requires the driver image to be linked
+    with /INTEGRITYCHECK (set in RansomShield.vcxproj and
+    RansomShield.Driver.vcxproj) and signed; otherwise it fails with
+    STATUS_ACCESS_DENIED. DriverEntry treats a failure as non-fatal: the
+    RS_MAX_TRACKED_PIDS cap still bounds memory, but PID reuse is then only
+    handled by eviction.
+
+    IRQL: PASSIVE_LEVEL.
+--*/
+NTSTATUS
+RsStartProcessLifecycleTracking(
+    VOID
+    )
+{
+    NTSTATUS status;
+
+    status = PsSetCreateProcessNotifyRoutineEx(RsProcessNotifyRoutine, FALSE);
+    if (NT_SUCCESS(status)) {
+        g_ProcessNotifyRegistered = TRUE;
+    }
+
+    return status;
+}
+
+/*++
+Routine Description:
+    Unregisters RsProcessNotifyRoutine if it was registered. Removal waits
+    for notifications already in progress, so after this returns no exit
+    notification can touch the context table. Call after FltUnregisterFilter
+    and before RsDestroyContextTracking.
+
+    IRQL: PASSIVE_LEVEL.
+--*/
+VOID
+RsStopProcessLifecycleTracking(
+    VOID
+    )
+{
+    NTSTATUS status;
+
+    if (!g_ProcessNotifyRegistered) {
+        return;
+    }
+
+    status = PsSetCreateProcessNotifyRoutineEx(RsProcessNotifyRoutine, TRUE);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("RansomShield: PsSetCreateProcessNotifyRoutineEx(remove) FAILED - 0x%08X\n", status);
+    }
+
+    g_ProcessNotifyRegistered = FALSE;
 }

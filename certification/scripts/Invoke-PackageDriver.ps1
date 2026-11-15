@@ -70,10 +70,21 @@ Copy-Item $inf -Destination $pkg -Force
 $stagedInf = Join-Path $pkg 'RansomShield.inf'
 $stagedCat = Join-Path $pkg 'RansomShield.cat'
 
-# ── Stamp DriverVer (date = today, version locked to 1.0.0.0 / the .rc) ───────
+# ── Stamp DriverVer (date = today, version = the one in RansomShield.inf) ────
+# The INF is the version's source of truth here; Set-RsVersion.ps1 keeps it in
+# step with kernel\RansomShield.rc (the release workflow runs it from the tag).
+$infText = Get-Content -Path $inf -Raw
+if ($infText -match '(?m)^DriverVer\s*=\s*[0-9/]+,(\d+\.\d+\.\d+\.\d+)') {
+    $driverVersion = $Matches[1]
+} else {
+    Write-RsFail 'Could not read the DriverVer version from RansomShield.inf.'
+    Write-RsGateResult -EvidenceDir $EvidenceDir -Gate 'PackageDriver' -Status 'Fail' `
+        -Details @{ reason = 'DriverVer not found in RansomShield.inf' } | Out-Null
+    exit 1
+}
 if ($stampinf) {
-    & $stampinf -f $stagedInf -d * -v 1.0.0.0 -a amd64 2>&1 | Out-Null
-    Write-RsInfo 'INF DriverVer stamped.'
+    & $stampinf -f $stagedInf -d * -v $driverVersion -a amd64 2>&1 | Out-Null
+    Write-RsInfo "INF DriverVer stamped ($driverVersion)."
 }
 
 # ── Generate the catalog ─────────────────────────────────────────────────────

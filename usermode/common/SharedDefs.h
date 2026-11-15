@@ -122,6 +122,21 @@ Environment:
 #define RS_DEFAULT_MONITORING_ENABLED      TRUE
 
 //
+// Accepted ranges for the runtime heuristic configuration.
+//
+// The driver rejects RsUpdateConfig values outside these ranges (0 still
+// means "leave unchanged", see RS_REQUEST_UPDATE_CONFIG), and ConfigManager
+// brings registry values back into range when it loads them. The threshold
+// may not exceed the per-PID timestamp ring buffer (RS_MAX_OPERATIONS_PER_PID
+// in kernel/RansomShield.h): a larger value could never be reached, which
+// would silently turn blocking off.
+//
+#define RS_MIN_FILE_COUNT_THRESHOLD        1
+#define RS_MAX_FILE_COUNT_THRESHOLD        256
+#define RS_MIN_TIME_WINDOW_SECONDS         1
+#define RS_MAX_TIME_WINDOW_SECONDS         3600
+
+//
 // ============================================================================
 // STRING & BUFFER LIMITS
 // ============================================================================
@@ -418,8 +433,8 @@ typedef struct _RS_REQUEST_RESUME {
 //
 typedef struct _RS_REQUEST_UPDATE_CONFIG {
     RS_MESSAGE_HEADER   Header;             // MessageType = RsUpdateConfig
-    ULONG               FileCountThreshold; // New threshold (0 = no change)
-    ULONG               TimeWindowSeconds;  // New time window (0 = no change)
+    ULONG               FileCountThreshold; // New threshold (0 = no change, else RS_MIN/MAX_FILE_COUNT_THRESHOLD)
+    ULONG               TimeWindowSeconds;  // New time window (0 = no change, else RS_MIN/MAX_TIME_WINDOW_SECONDS)
     BOOLEAN             MonitoringEnabled;  // New monitoring state (ignored if neither threshold nor window changed)
 } RS_REQUEST_UPDATE_CONFIG, *PRS_REQUEST_UPDATE_CONFIG;
 
